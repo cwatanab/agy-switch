@@ -25,9 +25,14 @@ jobs:
           go-version-file: go.mod
       - name: Check formatting
         shell: bash
-        run: test -z "$(gofmt -l pkg cmd)"
+        run: |
+          unformatted=$(gofmt -l pkg cmd)
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
       - name: Test with race detection
-        run: go test -race ./...
+        run: go test -race -timeout 120s ./...
       - name: Verify native binary and embedded version
         shell: bash
         run: |
