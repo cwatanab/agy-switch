@@ -1,0 +1,38 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is ARM64; retain the plan's explicit AMD64 coverage.
+        os: [ubuntu-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l pkg cmd)"
+      - name: Test with race detection
+        run: go test -race ./...
+      - name: Verify native binary and embedded version
+        shell: bash
+        run: |
+          go env GOOS GOARCH
+          binary="${RUNNER_TEMP}/agy-switch-smoke.exe"
+          go build -trimpath -ldflags "-X github.com/ZhangNy301/agy-switch/pkg/cli.Version=ci-smoke" -o "$binary" ./cmd/agy-switch
+          output=$("$binary" --version)
+          [[ "$output" == *"ci-smoke"* ]]

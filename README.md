@@ -1,98 +1,111 @@
 # agy-switch
 
-**Multi-account manager for [Antigravity CLI](https://github.com/google/antigravity) (`agy`)** — switch Google accounts in one keystroke, see every account's Gemini / Claude quota at a glance, and route `agy` through managed proxies when your network or region gets in the way.
-
-[中文文档](README.zh-CN.md)
-
-[![npm](https://img.shields.io/npm/v/agy-switch)](https://www.npmjs.com/package/agy-switch)
-[![license](https://img.shields.io/npm/l/agy-switch)](LICENSE)
-
-[![demo](https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.gif)](https://github.com/ZhangNy301/agy-switch/releases/download/demo-assets/agy-switch-demo.mp4)
-
-## Why
-
-`agy` keeps exactly one OAuth token on disk, so juggling multiple Google accounts means logging out and back in every time. **agy-switch** snapshots that token per account:
-
-- `asw` opens an interactive picker: ↑/↓ to choose, Enter to switch **and jump straight into `agy`**
-- Each account shows its email, subscription tier (Free / Pro / Ultra), Gemini and Claude 5-hour + weekly quota, and last-active time — refreshed live
-- Built-in **proxy manager**: multiple proxies with auto protocol detection (`https` / `socks5h` / `http`), exit-region + IP-type probe (hosting / residential / mobile), expiry dates, one-key toggle. Every `agy` run then uses the active proxy automatically
-- Warns you up front when Google APIs are unreachable or your IP region is unsupported by Google AI — no more mysterious `region not supported` errors
+Multi-account manager for [Antigravity CLI](https://github.com/google/antigravity) (`agy`). Switch Google accounts, view Gemini and Claude quotas, and route `agy` through a managed proxy.
 
 ## Requirements
 
-- Linux or macOS
-- Python 3.7+ (preinstalled on most systems)
-- `curl` (used for proxy probing and protocol detection)
-- [Antigravity CLI](https://github.com/google/antigravity) itself
+- Windows, Linux, or macOS, on amd64 or arm64.
+- Antigravity CLI installed and available on `PATH`.
+- The standalone binary requires no Python or Node.js runtime.
 
 ## Install
 
-**npm (recommended):**
+Download the binary for your platform from [GitHub Releases](https://github.com/ZhangNy301/agy-switch/releases):
 
-```bash
-npm install -g agy-switch
-```
+| Platform | File |
+| --- | --- |
+| Windows x64 | `agy-switch-windows-amd64.exe` |
+| Windows ARM64 | `agy-switch-windows-arm64.exe` |
+| Linux x64 | `agy-switch-linux-amd64` |
+| Linux ARM64 | `agy-switch-linux-arm64` |
+| macOS Intel | `agy-switch-darwin-amd64` |
+| macOS Apple Silicon | `agy-switch-darwin-arm64` |
 
-**curl (no Node.js needed):**
+On Windows, rename the file to `agy-switch.exe` and place it in a directory on your `PATH`. On Linux and macOS, rename it to `agy-switch`, run `chmod +x agy-switch`, and place it in a directory on your `PATH`, such as `~/.local/bin`.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ZhangNy301/agy-switch/main/install.sh | bash
-```
-
-Both give you two commands: `agy-switch` and its short alias `asw`. Make sure `~/.local/bin` is on your `PATH` (the installer tells you if it isn't).
+The current version is distributed as a Go binary. The former Python installer, npm launcher, and `asw` alias are no longer distributed.
 
 ## Quick start
 
-```bash
-agy-switch login     # add your first account (browser login via agy)
-agy-switch login     # ...and another one
-asw                  # pick an account → Enter → you're in agy
+```sh
+agy-switch login        # save an account through agy's browser login
+agy-switch login        # add another account
+agy-switch              # select an account and launch agy
 ```
 
-In the picker: `↑`/`↓` move, `Enter` switch & launch agy, `r` refresh quotas, `q` quit.
+Existing live credentials are saved before starting a new login. Profile names default to the email prefix; a conflicting name gets a numeric suffix. Logging in again with the same OAuth grant updates its existing profile.
+
+In the account picker: `↑`/`↓` navigate, `Enter` switches and launches `agy`, `r` refreshes quotas, and `q` quits. Cached quotas appear immediately while fresh values load in the background. Cached values remain visible if a refresh fails.
+
+Quota requests share a 15-second deadline and run at most four HTTP requests at a time. Adjust these with `--quota-timeout` and `--quota-concurrency`, for example `agy-switch --quota-timeout 30s --quota-concurrency 8`. Closing the picker cancels its pending requests.
 
 ## Commands
 
-| Command | What it does |
+| Command | Behavior |
 | --- | --- |
-| `agy-switch` / `asw` | Interactive account picker (switch + launch agy) |
-| `agy-switch ls` | Plain, non-interactive account list (cached quota) |
-| `agy-switch login` | Add another account without losing existing ones |
-| `agy-switch use <name>` | Switch non-interactively |
+| `agy-switch` / `agy-switch list` | Interactive account picker |
+| `agy-switch ls` | Plain account list |
+| `agy-switch login [name]` | Save and activate an account |
+| `agy-switch use <name>` | Switch accounts without launching agy |
 | `agy-switch rename <old> <new>` | Rename a profile |
-| `agy-switch logout [name] [--revoke]` | Remove an account from this machine (`--revoke` also kills the OAuth grant) |
-| `agy-switch proxy` | Interactive proxy manager |
-| `agy-switch proxy status` | Plain proxy + network status |
-| `agy-switch proxy on [name]` / `off` | Enable / disable a proxy non-interactively |
-| `agy-switch bridge [status\|stop]` | Inspect / stop the local bridge used for SOCKS proxies (started automatically) |
-| `agy-switch --version` | Print version |
+| `agy-switch logout [name]` | Remove a local profile; clear the live login if it matches |
+| `agy-switch proxy` | Interactive proxy selector |
+| `agy-switch proxy add <name> --server <host> --port <port>` | Register a proxy |
+| `agy-switch proxy on [name]` / `off` | Enable a configured proxy / disable routing |
+| `agy-switch proxy status` | Show the active proxy and probe its exit country |
+| `agy-switch bridge status` / `stop` | Inspect or stop the local SOCKS bridge |
+| `agy-switch --version` | Print the version |
 
-### Proxy manager keys
+## Proxies
 
-`↑`/`↓` select · `Enter` enable & quit · `space` toggle on/off · `a` add · `e` edit fields · `R` rename · `d` delete · `r` re-probe · `q` quit
+Add a proxy with automatic protocol detection, then enable it:
 
-Add flow asks only for `server`, `port`, `username?`, `password?` — the protocol is auto-detected by racing `https` / `socks5h` / `http` against agy's real API endpoint, so a proxy that is silently blocked in one protocol still lands on a working one.
+```sh
+agy-switch proxy add work --server proxy.example.com --port 1080
+agy-switch proxy on work
+```
 
-## How it works
+Use `--protocol http`, `https`, `socks5`, or `socks5h` to select a known protocol without probing. For authentication, use `--username <user>` and `--password-env <variable-name>` to read the password from an environment variable. Add `--activate` to enable a proxy immediately after registration. Existing proxy names cannot be overwritten by `proxy add`.
 
-- A **profile** is a snapshot of agy's OAuth credential. Switching writes the snapshot back. Tokens never appear on the command line or in output. Every credential location agy uses is supported: the macOS login keychain on GUI desktops (go-keyring item, service `gemini` / account `antigravity`), `~/.gemini/antigravity-cli/antigravity-oauth-token` (Linux, and macOS over SSH), and the legacy gemini-cli-style `~/.gemini/oauth_creds.json`. First run on a machine where agy is already logged in adopts that login as the first profile automatically.
-- Data lives in `~/.local/share/agy-switch/` (profiles, quota cache, proxy configs).
-- When a proxy is enabled, agy-switch installs a tiny shim at `~/.local/bin/agy` that exports the proxy environment and then execs the real `agy`. Your shell's own `http_proxy`/`https_proxy` still wins if you exported them.
-- **SOCKS proxies go through a local bridge.** Everything agy runs (its shell commands, `gh`, `git`, `npm`, …) inherits the proxy variables, and many tools can't use a `socks5h://` URL from them — `gh` and other binaries built with Go ≤ 1.22 fail with `error connecting to socks5h`, npm and Node don't speak SOCKS at all. So for a SOCKS proxy the shim exports `http://agy-switch:<token>@127.0.0.1:<port>` instead: a small HTTP proxy, started on demand, that forwards every request through your SOCKS proxy with remote DNS (like `socks5h`). It listens on localhost only, requires a random per-install token (other users on a shared host can't use your proxy), keeps the same port across restarts, picks up proxy edits without restarting agy, and exits once idle with no agy running. Your SOCKS credentials never appear in child processes' environment. `agy-switch bridge status` / `stop` inspect it; its log is `~/.local/share/agy-switch/bridge.log`.
-- Quotas are read from agy's local state and refreshed in the background; cached values are shown when refresh fails.
+In the proxy selector: `↑`/`↓` navigate, `space` toggles the selected proxy, and `Enter` or `q` exits. Register proxies with `proxy add` before opening the selector.
+
+Enabling a proxy installs an `agy` shim in `~/.local/bin` on Unix or `%LOCALAPPDATA%\agy-switch\bin` on Windows. Put that directory before the original agy directory on `PATH`. If an original executable occupies the shim path, it is moved to `agy.real` (or `agy.real.exe`). Disabling routing restores it. A pre-existing backup is never overwritten.
+
+SOCKS proxies use a separate local HTTP bridge so agy and its child tools can use standard HTTP proxy environment variables. The bridge binds to localhost, requires a random authentication token, survives the session that started it, and exits after five idle minutes with no agy processes running. `bridge stop` sends an authenticated stop request to the bridge. Bridge logs are stored in the data directory as `bridge.log`.
+
+## Data and credentials
+
+Data is stored under `$XDG_DATA_HOME/agy-switch` (default `~/.local/share/agy-switch`) on Unix and `%LOCALAPPDATA%\agy-switch` on Windows. Profiles contain OAuth credentials and are written with private file permissions.
+
+Live credentials use the macOS Keychain, Windows Credential Manager, or agy's token files in `~/.gemini`, according to the platform. Profile switching restores the selected credential to agy's live store.
+
+Account changes are serialized across agy-switch processes. Failed changes attempt to restore the previous credentials and profile files. An incomplete recovery returns an error and retains its recovery journal. If a command is interrupted, the next account operation attempts recovery before making another change.
+
+### OAuth client configuration
+
+Refreshing an expired quota access token requires the OAuth client associated with its refresh token. Configure `AGY_SWITCH_OAUTH_CLIENT_ID` and `AGY_SWITCH_OAUTH_CLIENT_SECRET`, or place an `oauth_client.json` file in the data directory:
+
+```json
+{"client_id":"your-client-id","client_secret":"your-client-secret"}
+```
+
+Set both environment variables together; they override the file. On Unix, keep the file readable only by its owner (`chmod 600`). A different OAuth client's credentials cannot refresh an existing token. OAuth client credentials are no longer embedded in the source or distributed binaries. Account switching and cached quota display work without this configuration; quota refresh reports a configuration error when an access token needs renewal.
+
+## Build and test
+
+Use the Go version specified in `go.mod`:
+
+```sh
+go test -race ./...
+make build
+make build-all
+```
+
+`make build` writes `dist/agy-switch`. `make build-all` builds all six release targets. Override the embedded version with `make build-all VERSION=1.2.3`.
 
 ## Uninstall
 
-```bash
-agy-switch proxy off            # stop injecting the proxy
-npm uninstall -g agy-switch     # or: rm ~/.local/bin/agy-switch ~/.local/bin/asw
-rm -rf ~/.local/share/agy-switch
-# if ~/.local/bin/agy is the agy-switch shim, remove it too (it says so in its header)
-```
-
-## Contributing
-
-Issues and pull requests are welcome. The whole CLI is a single dependency-free Python file (`bin/agy-switch`) — read it, hack it, send a PR.
+Run `agy-switch proxy off` to restore any original agy executable, then `agy-switch bridge stop`. Remove the `agy-switch` binary from your `PATH`. Delete the data directory only if you also want to remove saved profiles and proxy credentials.
 
 ## License
 
