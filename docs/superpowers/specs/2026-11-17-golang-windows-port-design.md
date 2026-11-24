@@ -8,7 +8,7 @@
 
 ## 1. Intent & Context
 
-`agy-switch` is currently a single ~2,900-line Python script (`bin/agy-switch`) wrapped in a Node.js launcher (`lib/launcher.js`). It manages multiple Google accounts for the Antigravity CLI (`agy`), displays live Claude/Gemini quota statuses, and provides an integrated proxy manager with a local SOCKS5-to-HTTP bridge.
+`agy-switch` ([ZhangNy301/agy-switch](https://github.com/ZhangNy301/agy-switch)) is currently a single ~2,900-line Python script (`bin/agy-switch`) wrapped in a Node.js launcher (`lib/launcher.js`). It manages multiple Google accounts for the Antigravity CLI (`agy`), displays live Claude/Gemini quota statuses, and provides an integrated proxy manager with a local SOCKS5-to-HTTP bridge.
 
 Currently, it cannot run on Windows because:
 1. The interactive TUI relies on Unix-specific modules (`termios`, `tty`).

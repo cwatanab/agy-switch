@@ -2,6 +2,8 @@
 
 Multi-account manager for [Antigravity CLI](https://github.com/google/antigravity) (`agy`). Switch Google accounts, view Gemini and Claude quotas, and route `agy` through a managed proxy.
 
+This project is a Go implementation based on [ZhangNy301/agy-switch](https://github.com/ZhangNy301/agy-switch).
+
 ## Requirements
 
 - Windows, Linux, or macOS, on amd64 or arm64.
@@ -10,7 +12,7 @@ Multi-account manager for [Antigravity CLI](https://github.com/google/antigravit
 
 ## Install
 
-Download the binary for your platform from [GitHub Releases](https://github.com/ZhangNy301/agy-switch/releases):
+Download the binary for your platform from [GitHub Releases](https://github.com/cwatanab/agy-switch/releases):
 
 | Platform | File |
 | --- | --- |
@@ -106,6 +108,10 @@ make build-all
 ## Uninstall
 
 Run `agy-switch proxy off` to restore any original agy executable, then `agy-switch bridge stop`. Remove the `agy-switch` binary from your `PATH`. Delete the data directory only if you also want to remove saved profiles and proxy credentials.
+
+## Acknowledgments
+
+This project is based on and references [ZhangNy301/agy-switch](https://github.com/ZhangNy301/agy-switch).
 
 ## License
 
