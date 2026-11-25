@@ -164,12 +164,13 @@ func TestBuildProxyEnv_RespectsExistingEnv(t *testing.T) {
 	if err := store.Save(proxy.Config{Name: "p1", Server: "proxy.local", Port: 8080, Protocol: "http", Active: true}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HTTP_PROXY", "http://user-shell:3128")
-	t.Setenv("HTTPS_PROXY", "")
-	t.Setenv("ALL_PROXY", "")
+	// Clear lowercase variants before setting HTTP_PROXY (Windows env vars are case-insensitive).
 	t.Setenv("http_proxy", "")
 	t.Setenv("https_proxy", "")
 	t.Setenv("all_proxy", "")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("HTTP_PROXY", "http://user-shell:3128")
 
 	env, err := shim.BuildProxyEnv(paths, store)
 	if err != nil {
