@@ -49,27 +49,27 @@ type editField struct {
 }
 
 type addWizardState struct {
-	step      int // 0..6 inputs, 7 dupe confirm, 8 final confirm
-	cfg       proxy.Config
-	validity  string
-	fallback  string
-	input     string
-	racing    bool
-	errMsg    string
-	dupeName  string
-	detected  bool
-	envNote   bool
+	step     int // 0..6 inputs, 7 dupe confirm, 8 final confirm
+	cfg      proxy.Config
+	validity string
+	fallback string
+	input    string
+	racing   bool
+	errMsg   string
+	dupeName string
+	detected bool
+	envNote  bool
 }
 
 type editState struct {
-	origName   string
-	fields     []editField
-	cursor     int
-	editing    bool
-	input      string
-	dirty      bool
-	errMsg     string
-	expiresAt  int64
+	origName  string
+	fields    []editField
+	cursor    int
+	editing   bool
+	input     string
+	dirty     bool
+	errMsg    string
+	expiresAt int64
 }
 
 type ProxyModel struct {
