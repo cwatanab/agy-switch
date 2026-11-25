@@ -3,6 +3,9 @@ package quota
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/ZhangNy301/agy-switch/pkg/util"
 )
 
 func applyTier(info *QuotaInfo, lc map[string]interface{}) {
@@ -12,6 +15,10 @@ func applyTier(info *QuotaInfo, lc map[string]interface{}) {
 			info.Tier = "Ultra"
 		} else if strings.Contains(pid, "pro") {
 			info.Tier = "Pro"
+		} else if strings.Contains(pid, "free") {
+			info.Tier = "Free"
+		} else if strings.Contains(pid, "standard") {
+			info.Tier = "Standard"
 		} else if name, nOk := paid["name"].(string); nOk && name != "" {
 			info.Tier = name
 		}
@@ -48,14 +55,21 @@ func applySummary(info *QuotaInfo, qs map[string]interface{}) {
 					if f, ok := bMap["remainingFraction"].(float64); ok {
 						frac = f
 					}
-					reset := fmt.Sprintf("%v", bMap["resetTime"])
+					reset, _ := bMap["resetTime"].(string)
+					desc, _ := bMap["description"].(string)
+					disabled := window == "5h" && strings.Contains(strings.ToLower(desc), "does not currently apply")
 
 					if strings.Contains(name, "gemini") {
 						if window == "5h" {
 							info.Gemini5hFraction = frac
 							info.Gemini5hReset = reset
+							info.Gemini5hDisabled = disabled
 							info.HasGemini = true
 						} else if window == "weekly" {
+							info.GeminiWeeklyFraction = frac
+							info.GeminiWeeklyReset = reset
+							info.GeminiWeeklyDisabled = disabled
+							info.HasGeminiWeekly = true
 							info.WeeklyFraction = frac
 							info.WeeklyReset = reset
 						}
@@ -63,8 +77,13 @@ func applySummary(info *QuotaInfo, qs map[string]interface{}) {
 						if window == "5h" {
 							info.Claude5hFraction = frac
 							info.Claude5hReset = reset
+							info.Claude5hDisabled = disabled
 							info.HasClaude = true
 						} else if window == "weekly" {
+							info.ClaudeWeeklyFraction = frac
+							info.ClaudeWeeklyReset = reset
+							info.ClaudeWeeklyDisabled = disabled
+							info.HasClaudeWeekly = true
 							info.WeeklyFraction = frac
 							info.WeeklyReset = reset
 						}
@@ -77,35 +96,64 @@ func applySummary(info *QuotaInfo, qs map[string]interface{}) {
 }
 
 func applyModels(info *QuotaInfo, uq map[string]interface{}) {
-	if uq != nil {
-		if buckets, ok := uq["buckets"].([]interface{}); ok {
-			for _, b := range buckets {
-				bMap, ok := b.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				modelID := strings.ToLower(fmt.Sprintf("%v", bMap["modelId"]))
-				var frac float64
-				if f, ok := bMap["remainingFraction"].(float64); ok {
-					frac = f
-				}
-				reset := fmt.Sprintf("%v", bMap["resetTime"])
+	applyModelsAt(info, uq, time.Now())
+}
 
-				if strings.Contains(modelID, "gemini") {
-					if !info.HasGemini || strings.Contains(modelID, "2.5-pro") {
-						info.Gemini5hFraction = frac
-						info.Gemini5hReset = reset
-						info.HasGemini = true
+func applyModelsAt(info *QuotaInfo, uq map[string]interface{}, now time.Time) {
+	if uq == nil {
+		return
+	}
+	summaryHasGemini := info.HasGemini
+	summaryHasGeminiWeekly := info.HasGeminiWeekly
+	summaryHasClaude := info.HasClaude
+	summaryHasClaudeWeekly := info.HasClaudeWeekly
+
+	if buckets, ok := uq["buckets"].([]interface{}); ok {
+		for _, b := range buckets {
+			bMap, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			modelID := strings.ToLower(fmt.Sprintf("%v", bMap["modelId"]))
+			var frac float64
+			if f, ok := bMap["remainingFraction"].(float64); ok {
+				frac = f
+			}
+			reset, _ := bMap["resetTime"].(string)
+			ts, hasTS := util.ParseTimestamp(reset)
+			isWeekly := hasTS && ts.Sub(now) > 24*time.Hour
+
+			if strings.Contains(modelID, "gemini") {
+				if isWeekly {
+					if !summaryHasGeminiWeekly && (!info.HasGeminiWeekly || strings.Contains(modelID, "2.5-pro")) {
+						info.GeminiWeeklyFraction = frac
+						info.GeminiWeeklyReset = reset
+						info.HasGeminiWeekly = true
+						if !info.HasClaudeWeekly {
+							info.WeeklyFraction = frac
+							info.WeeklyReset = reset
+						}
 					}
-				} else if strings.Contains(modelID, "claude") {
-					if !info.HasClaude || strings.Contains(modelID, "sonnet") {
-						info.Claude5hFraction = frac
-						info.Claude5hReset = reset
-						info.HasClaude = true
+				} else if !summaryHasGemini && (!info.HasGemini || strings.Contains(modelID, "2.5-pro")) {
+					info.Gemini5hFraction = frac
+					info.Gemini5hReset = reset
+					info.HasGemini = true
+				}
+			} else if strings.Contains(modelID, "claude") {
+				if isWeekly {
+					if !summaryHasClaudeWeekly && (!info.HasClaudeWeekly || strings.Contains(modelID, "sonnet")) {
+						info.ClaudeWeeklyFraction = frac
+						info.ClaudeWeeklyReset = reset
+						info.HasClaudeWeekly = true
+						info.WeeklyFraction = frac
+						info.WeeklyReset = reset
 					}
+				} else if !summaryHasClaude && (!info.HasClaude || strings.Contains(modelID, "sonnet")) {
+					info.Claude5hFraction = frac
+					info.Claude5hReset = reset
+					info.HasClaude = true
 				}
 			}
 		}
 	}
-
 }

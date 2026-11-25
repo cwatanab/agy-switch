@@ -27,6 +27,12 @@ func (c *Client) postJSON(ctx context.Context, token, path string, body interfac
 	return c.requestJSON(ctx, c.baseURL+path, data, headers)
 }
 
+type httpStatusError struct {
+	status int
+}
+
+func (e httpStatusError) Error() string { return fmt.Sprintf("API returned HTTP %d", e.status) }
+
 func (c *Client) requestJSON(ctx context.Context, target string, data []byte, headers http.Header) (map[string]interface{}, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -41,7 +47,7 @@ func (c *Client) requestJSON(ctx context.Context, target string, data []byte, he
 		if err != nil {
 			lastErr = err
 		} else {
-			lastErr = fmt.Errorf("API returned HTTP %d", status)
+			lastErr = httpStatusError{status: status}
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

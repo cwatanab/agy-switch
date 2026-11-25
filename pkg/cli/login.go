@@ -7,13 +7,45 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/ZhangNy301/agy-switch/pkg/profile"
+	"github.com/ZhangNy301/agy-switch/pkg/proxy"
 	"github.com/ZhangNy301/agy-switch/pkg/shim"
+	"github.com/ZhangNy301/agy-switch/pkg/util"
 	"github.com/spf13/cobra"
 )
 
+func sanitizeProfileBase(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			return r
+		}
+		return '-'
+	}, s)
+}
+
 func (a *app) login(cmd *cobra.Command, args []string) error {
+	if !a.deps.DisableNetCheck {
+		state, cc := a.checkNetwork(cmd.Context())
+		if state != proxy.NetStateOK {
+			why := "Google's API is unreachable from this network"
+			if state == proxy.NetStateRegion {
+				if cc == "" {
+					cc = "?"
+				}
+				why = fmt.Sprintf("your IP region (%s) is not supported by Google AI", cc)
+			}
+			cmd.PrintErrf("warning: %s — the login callback will likely hang.\n  fix: agy-switch proxy (add a proxy through a supported region first)\n", why)
+			if !a.deps.IsTTY() {
+				return fmt.Errorf("%s", why)
+			}
+			if !confirmYesNo(cmd.InOrStdin(), cmd.ErrOrStderr(), "  continue anyway? [y/N] ") {
+				return fmt.Errorf("login cancelled")
+			}
+		}
+	}
+
 	realAgy, err := a.deps.FindAgy(a.paths)
 	if err != nil {
 		return err
@@ -56,15 +88,38 @@ func (a *app) login(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
+
+		// Check if grant already exists before prompting for a name.
+		existingMatch := false
+		if existing, lErr := tx.List(); lErr == nil {
+			for _, p := range existing {
+				if (tok.RefreshToken != "" && tok.RefreshToken == p.Token.RefreshToken) ||
+					(tok.RefreshToken == "" && tok.AccessToken == p.Token.AccessToken) {
+					existingMatch = true
+					break
+				}
+			}
+		}
+
 		base := ""
 		if len(args) > 0 {
-			base = strings.Map(func(r rune) rune {
-				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-					return r
+			base = sanitizeProfileBase(args[0])
+		} else if !existingMatch && a.deps.IsTTY() {
+			def := "account"
+			if tok.Email != "" {
+				def = sanitizeProfileBase(strings.Split(tok.Email, "@")[0])
+				if def == "" {
+					def = "account"
 				}
-				return '-'
-			}, args[0])
+			}
+			cmd.Printf("logged in as %s — save profile as [%s]: ", tok.Email, def)
+			if entered, rErr := readLine(cmd.InOrStdin()); rErr == nil && entered != "" && util.ValidateName(entered) == nil {
+				base = entered
+			} else {
+				base = def
+			}
 		}
+
 		name, err = tx.Save(base, data)
 		if err != nil {
 			return fmt.Errorf("snapshot profile: %w", err)
@@ -77,6 +132,7 @@ func (a *app) login(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	_ = a.profiles.RecordActivated(name, time.Now())
 	cmd.Printf("Successfully saved and activated new profile: %s (%s)\n", name, tok.Email)
 	// A quota failure must not undo an already committed login.
 	_, _ = a.quota.FetchContext(cmd.Context(), tok, true)

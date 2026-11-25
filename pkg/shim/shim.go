@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ZhangNy301/agy-switch/pkg/config"
+	"github.com/ZhangNy301/agy-switch/pkg/proxy"
 	"github.com/ZhangNy301/agy-switch/pkg/util"
 )
 
@@ -185,4 +186,70 @@ func Uninstall(paths *config.Paths) error {
 		}
 	}
 	return nil
+}
+
+// ShimPathFor returns the expected shim path in paths.BinDir for the current OS.
+func ShimPathFor(paths *config.Paths) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(paths.BinDir, "agy.exe")
+	}
+	return filepath.Join(paths.BinDir, "agy")
+}
+
+// BackupPathFor returns the backup real binary path for a shim path.
+func BackupPathFor(shimPath string) string {
+	return backupPath(shimPath)
+}
+
+// Status reports whether the agy shim is currently installed and active.
+func Status(paths *config.Paths, store *proxy.Store) (bool, string) {
+	if store != nil {
+		if recorded, _, err := store.ShimPaths(); err == nil && recorded != "" {
+			if IsShim(recorded) {
+				return true, recorded
+			}
+		}
+	}
+	for _, c := range []string{
+		filepath.Join(paths.BinDir, "agy"),
+		filepath.Join(paths.BinDir, "agy.exe"),
+		filepath.Join(paths.BinDir, "agy.cmd"),
+	} {
+		if IsShim(c) {
+			return true, c
+		}
+	}
+	return false, ""
+}
+
+// Repair restores the shim if agy self-updated and replaced it with a real binary.
+func Repair(paths *config.Paths, store *proxy.Store) error {
+	if store == nil {
+		return nil
+	}
+	active, err := store.Active()
+	if err != nil || active == nil {
+		return nil
+	}
+	shimPath, realPath, err := store.ShimPaths()
+	if err != nil {
+		return nil
+	}
+	if shimPath == "" {
+		shimPath = ShimPathFor(paths)
+		realPath = backupPath(shimPath)
+	}
+	info, err := os.Lstat(shimPath)
+	if err != nil || info.IsDir() || IsShim(shimPath) {
+		return nil
+	}
+	// A non-shim file sits at shimPath while our backup already exists: agy update replaced the shim.
+	if realPath != "" {
+		if _, bErr := os.Lstat(realPath); bErr == nil {
+			if err := os.Rename(shimPath, realPath); err != nil {
+				return fmt.Errorf("update backed-up agy binary: %w", err)
+			}
+		}
+	}
+	return Install(paths, realPath)
 }

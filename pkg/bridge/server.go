@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,7 @@ type Server struct {
 	lastReq    atomic.Int64
 	mu         sync.Mutex
 	conns      map[net.Conn]struct{}
+	proxyInfo  os.FileInfo
 	ctx        context.Context
 	cancel     context.CancelFunc
 	opts       ServerOptions
@@ -109,14 +111,21 @@ func (s *Server) refreshUpstream() error {
 	if !s.managed {
 		return nil
 	}
+	stat, statErr := os.Stat(filepath.Join(s.paths.DataDir, "proxy.json"))
+	s.mu.Lock()
+	if statErr == nil && s.upstream != nil && s.proxyInfo != nil &&
+		os.SameFile(stat, s.proxyInfo) && stat.Size() == s.proxyInfo.Size() && stat.ModTime() == s.proxyInfo.ModTime() {
+		s.mu.Unlock()
+		return nil
+	}
+	previous := s.upstream
+	s.mu.Unlock()
+
 	store := proxy.NewStore(s.paths)
 	cfg, err := store.Active()
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	previous := s.upstream
-	s.mu.Unlock()
 	if cfg == nil || (cfg.Protocol != "socks5" && cfg.Protocol != "socks5h") {
 		if previous == nil {
 			return fmt.Errorf("no SOCKS upstream available")
@@ -133,6 +142,11 @@ func (s *Server) refreshUpstream() error {
 	s.mu.Lock()
 	changed := s.upstream == nil || *s.upstream != *cfg
 	s.upstream = cfg
+	if statErr == nil {
+		s.proxyInfo = stat
+	} else {
+		s.proxyInfo = nil
+	}
 	s.mu.Unlock()
 	if changed {
 		s.transport.CloseIdleConnections()

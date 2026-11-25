@@ -14,8 +14,8 @@ import (
 
 const TargetEndpoint = "https://daily-cloudcode-pa.googleapis.com"
 
-func testProxy(proto, server string, port int, user, pass string, timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func testProxy(parent context.Context, proto, server string, port int, user, pass string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	hostPort := fmt.Sprintf("%s:%d", server, port)
@@ -92,6 +92,9 @@ func RaceProtocol(server string, port int, user, pass string) (string, error) {
 	}
 	_ = conn.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Priority order: https, socks5h, http
 	candidates := []string{"https", "socks5h", "http"}
 	type result struct {
@@ -105,7 +108,7 @@ func RaceProtocol(server string, port int, user, pass string) (string, error) {
 		wg.Add(1)
 		go func(idx int, proto string) {
 			defer wg.Done()
-			if testProxy(proto, server, port, user, pass, 3*time.Second) {
+			if testProxy(ctx, proto, server, port, user, pass, 3*time.Second) {
 				resChan <- result{proto: proto, index: idx}
 			}
 		}(i, cand)

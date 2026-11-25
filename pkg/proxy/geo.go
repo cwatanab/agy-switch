@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -24,6 +23,11 @@ var blockedCountries = map[string]bool{
 	"SY": true,
 }
 
+// IsBlockedCountry reports whether the country code is unsupported by Google AI.
+func IsBlockedCountry(cc string) bool {
+	return blockedCountries[strings.ToUpper(strings.TrimSpace(cc))]
+}
+
 func ProbeGeo(proxyURL string) (string, bool, error) {
 	return ProbeGeoWithURL(proxyURL, DefaultGeoURL)
 }
@@ -34,13 +38,12 @@ func ProbeGeoWithURL(proxyURL, targetURL string) (string, bool, error) {
 	}
 
 	if proxyURL != "" {
-		pURL, err := url.Parse(proxyURL)
+		tr, err := TransportForProxyURL(proxyURL)
 		if err != nil {
-			return "", false, fmt.Errorf("invalid proxy url: %w", err)
+			return "", false, err
 		}
-		client.Transport = &http.Transport{
-			Proxy: http.ProxyURL(pURL),
-		}
+		defer tr.CloseIdleConnections()
+		client.Transport = tr
 	}
 
 	resp, err := client.Get(targetURL)
@@ -67,6 +70,5 @@ func ProbeGeoWithURL(proxyURL, targetURL string) (string, bool, error) {
 		cc = strings.ToUpper(res.CountryCode)
 	}
 
-	blocked := blockedCountries[cc]
-	return cc, blocked, nil
+	return cc, IsBlockedCountry(cc), nil
 }

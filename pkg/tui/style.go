@@ -1,6 +1,20 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+var Version string
+
+func formatTitle(subtitle string) string {
+	if v := strings.TrimPrefix(strings.TrimSpace(Version), "v"); v != "" {
+		return fmt.Sprintf("✦ agy-switch v%s — %s", v, subtitle)
+	}
+	return fmt.Sprintf("✦ agy-switch — %s", subtitle)
+}
 
 var (
 	TitleStyle = lipgloss.NewStyle().

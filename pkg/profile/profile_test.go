@@ -258,3 +258,68 @@ func TestManager_AdoptLiveIfOrphan(t *testing.T) {
 		t.Errorf("expected second call to return empty, got %s (err %v)", secondAdopt, err)
 	}
 }
+
+func TestManager_MetaActiveNameAndClobber(t *testing.T) {
+	dir := t.TempDir()
+	paths := &config.Paths{
+		DataDir:     dir,
+		ProfilesDir: filepath.Join(dir, "profiles"),
+		LiveToken:   filepath.Join(dir, "live-token"),
+	}
+	_ = config.EnsureDirs(paths)
+
+	p1 := []byte(`{"token":{"access_token":"at-1","refresh_token":"rt-1"},"email":"one@example.com"}`)
+	p2 := []byte(`{"token":{"access_token":"at-2","refresh_token":"rt-2"},"email":"two@example.com"}`)
+	store := &mockKeyring{data: p1}
+	mgr := profile.NewManager(paths, store)
+
+	if err := mgr.Snapshot("one"); err != nil {
+		t.Fatal(err)
+	}
+	store.data = p2
+	if err := mgr.Snapshot("two"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without current file, ActiveName falls back to matching live refresh token ("two")
+	if got := mgr.ActiveName(); got != "two" {
+		t.Fatalf("ActiveName() = %q, want two", got)
+	}
+
+	if err := mgr.Use("one"); err != nil {
+		t.Fatal(err)
+	}
+	list, err := mgr.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oneProf profile.Profile
+	for _, p := range list {
+		if p.Name == "one" {
+			oneProf = p
+		}
+	}
+	if oneProf.ActivatedAt.IsZero() {
+		t.Fatal("expected ActivatedAt to be recorded on Use")
+	}
+
+	// Clobber live token with two's refresh token
+	store.data = p2
+	if clobbered, cur := mgr.LiveWasClobbered(); !clobbered || cur != "one" {
+		t.Fatalf("LiveWasClobbered() = (%v, %q), want (true, one)", clobbered, cur)
+	}
+
+	if err := mgr.Rename("one", "one-renamed"); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = mgr.List()
+	found := false
+	for _, p := range list {
+		if p.Name == "one-renamed" && !p.ActivatedAt.IsZero() {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected ActivatedAt to follow Rename")
+	}
+}

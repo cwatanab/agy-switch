@@ -14,9 +14,15 @@ import (
 type Token struct {
 	AccessToken  string                 `json:"access_token"`
 	RefreshToken string                 `json:"refresh_token"`
+	IDToken      string                 `json:"id_token,omitempty"`
 	ExpiresAt    time.Time              `json:"expires_at"`
 	Email        string                 `json:"email"`
 	Raw          map[string]interface{} `json:"-"`
+}
+
+// DecodeJWTEmail extracts the email claim from a JWT without verifying its signature.
+func DecodeJWTEmail(jwt string) string {
+	return decodeJWTEmail(jwt)
 }
 
 func decodeJWTEmail(jwt string) string {
@@ -113,14 +119,13 @@ func ParseTokenJSON(data []byte) (*Token, error) {
 	}
 
 	// 2. JWT in id_token
-	if tok.Email == "" {
-		for _, m := range []map[string]interface{}{raw, tokenObj} {
-			if idt, ok := m["id_token"].(string); ok && idt != "" {
+	for _, m := range []map[string]interface{}{raw, tokenObj} {
+		if idt, ok := m["id_token"].(string); ok && idt != "" {
+			tok.IDToken = idt
+			if tok.Email == "" {
 				tok.Email = decodeJWTEmail(idt)
-				if tok.Email != "" {
-					break
-				}
 			}
+			break
 		}
 	}
 
@@ -149,4 +154,46 @@ func ParseTokenJSON(data []byte) (*Token, error) {
 	}
 
 	return tok, nil
+}
+
+// UpdateRawToken writes refreshed fields back into tok.Raw (preserving nested vs flat structure)
+// and returns the serialized JSON bytes.
+func UpdateRawToken(tok *Token) ([]byte, error) {
+	if tok == nil {
+		return nil, fmt.Errorf("nil token")
+	}
+	raw := make(map[string]interface{}, len(tok.Raw)+4)
+	for k, v := range tok.Raw {
+		raw[k] = v
+	}
+	target := raw
+	if inner, ok := raw["token"].(map[string]interface{}); ok {
+		innerCopy := make(map[string]interface{}, len(inner)+4)
+		for k, v := range inner {
+			innerCopy[k] = v
+		}
+		raw["token"] = innerCopy
+		target = innerCopy
+	}
+	if tok.AccessToken != "" {
+		target["access_token"] = tok.AccessToken
+	}
+	if tok.RefreshToken != "" {
+		target["refresh_token"] = tok.RefreshToken
+	}
+	if !tok.ExpiresAt.IsZero() {
+		target["expiry"] = tok.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	if tok.IDToken != "" {
+		raw["id_token"] = tok.IDToken
+	}
+	if tok.Email != "" {
+		if _, has := raw["id_token_email"]; has || raw["token"] != nil {
+			raw["id_token_email"] = tok.Email
+		} else {
+			raw["email"] = tok.Email
+		}
+	}
+	tok.Raw = raw
+	return json.Marshal(raw)
 }

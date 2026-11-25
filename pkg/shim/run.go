@@ -15,8 +15,12 @@ import (
 	"github.com/ZhangNy301/agy-switch/pkg/proxy"
 )
 
-func EnsureBridge(paths *config.Paths, _ *proxy.Config) (int, string, error) {
+var ensureBridgeFn = func(paths *config.Paths, _ *proxy.Config) (int, string, error) {
 	return bridge.EnsureDaemon(paths)
+}
+
+func EnsureBridge(paths *config.Paths, cfg *proxy.Config) (int, string, error) {
+	return ensureBridgeFn(paths, cfg)
 }
 
 func BuildProxyEnv(paths *config.Paths, store *proxy.Store) ([]string, error) {
@@ -45,7 +49,8 @@ func BuildProxyEnv(paths *config.Paths, store *proxy.Store) ([]string, error) {
 		if bErr == nil && port > 0 && token != "" {
 			proxyURL = fmt.Sprintf("http://%s:%s@127.0.0.1:%d", bridge.BridgeUser, token, port)
 		} else {
-			return nil, fmt.Errorf("start SOCKS bridge: %w", bErr)
+			fmt.Fprintf(os.Stderr, "agy-switch: local proxy bridge failed to start (see %s): %v —\n  exporting the SOCKS URL directly; tools without socks5h support (gh, npm, ...) may fail\n", paths.BridgeLog, bErr)
+			proxyURL = active.RawURL(false)
 		}
 	} else {
 		proxyURL = active.URL()
@@ -56,17 +61,15 @@ func BuildProxyEnv(paths *config.Paths, store *proxy.Store) ([]string, error) {
 	}
 
 	noProxy := "localhost,127.0.0.1,::1"
-
-	return []string{
-		"HTTP_PROXY=" + proxyURL,
-		"HTTPS_PROXY=" + proxyURL,
-		"ALL_PROXY=" + proxyURL,
-		"http_proxy=" + proxyURL,
-		"https_proxy=" + proxyURL,
-		"all_proxy=" + proxyURL,
-		"NO_PROXY=" + noProxy,
-		"no_proxy=" + noProxy,
-	}, nil
+	proxyVars := []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+	env := make([]string, 0, len(proxyVars)+2)
+	for _, k := range proxyVars {
+		if v, ok := os.LookupEnv(k); !ok || v == "" {
+			env = append(env, k+"="+proxyURL)
+		}
+	}
+	env = append(env, "NO_PROXY="+noProxy, "no_proxy="+noProxy)
+	return env, nil
 }
 
 func ExecuteRealAgy(paths *config.Paths, args []string) (int, error) {

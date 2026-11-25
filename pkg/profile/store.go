@@ -15,12 +15,13 @@ import (
 )
 
 type Profile struct {
-	Name     string                 `json:"name"`
-	Email    string                 `json:"email"`
-	Tier     string                 `json:"tier,omitempty"`
-	LastUsed time.Time              `json:"last_used"`
-	Token    Token                  `json:"token"`
-	RawToken map[string]interface{} `json:"raw_token"`
+	Name        string                 `json:"name"`
+	Email       string                 `json:"email"`
+	Tier        string                 `json:"tier,omitempty"`
+	LastUsed    time.Time              `json:"last_used"`
+	ActivatedAt time.Time              `json:"activated_at,omitempty"`
+	Token       Token                  `json:"token"`
+	RawToken    map[string]interface{} `json:"raw_token"`
 }
 
 type Manager struct {
@@ -55,6 +56,8 @@ func (m *Manager) List() ([]Profile, error) {
 		return nil, fmt.Errorf("read profiles directory: %w", err)
 	}
 
+	meta, _ := m.LoadMeta()
+
 	var profiles []Profile
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
@@ -80,12 +83,18 @@ func (m *Manager) List() ([]Profile, error) {
 			modTime = info.ModTime()
 		}
 
+		var activatedAt time.Time
+		if pm, ok := meta[name]; ok && pm.ActivatedAt > 0 {
+			activatedAt = time.Unix(pm.ActivatedAt, 0).UTC()
+		}
+
 		p := Profile{
-			Name:     name,
-			Email:    tok.Email,
-			LastUsed: modTime,
-			Token:    *tok,
-			RawToken: tok.Raw,
+			Name:        name,
+			Email:       tok.Email,
+			LastUsed:    modTime,
+			ActivatedAt: activatedAt,
+			Token:       *tok,
+			RawToken:    tok.Raw,
 		}
 		profiles = append(profiles, p)
 	}
@@ -240,6 +249,7 @@ func (m *Manager) adoptLiveIfOrphan() (string, error) {
 	if err := m.SetCurrent(name); err != nil {
 		return "", err
 	}
+	_ = m.RecordActivated(name, time.Now())
 	return name, nil
 }
 
@@ -297,6 +307,7 @@ func (m *Manager) use(name string) error {
 	if err := m.SetCurrent(name); err != nil {
 		return err
 	}
+	_ = m.RecordActivated(name, time.Now())
 
 	// Last-used display is best effort; it must not undo a completed switch.
 	now := time.Now()
@@ -355,6 +366,7 @@ func (m *Manager) rename(oldName, newName string) error {
 			return err
 		}
 	}
+	m.renameMeta(oldName, newName)
 	return nil
 }
 
@@ -392,6 +404,7 @@ func (m *Manager) delete(name string) error {
 	if err := m.removeFile(target); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete profile %s: %w", name, err)
 	}
+	m.deleteMeta(name)
 	return nil
 }
 
@@ -488,4 +501,75 @@ func (m *Manager) AdoptLiveIfOrphan() (name string, err error) {
 		return err
 	})
 	return name, err
+}
+
+// ActiveName returns Current() if set, or falls back to matching the live token against saved profiles.
+func (m *Manager) ActiveName() string {
+	if cur, err := m.Current(); err == nil && cur != "" {
+		return cur
+	}
+	liveData, err := m.store.ReadLive()
+	if err != nil {
+		return ""
+	}
+	liveTok, err := parseCredential(liveData)
+	if err != nil || liveTok.RefreshToken == "" {
+		return ""
+	}
+	profiles, err := m.List()
+	if err != nil {
+		return ""
+	}
+	for _, p := range profiles {
+		if p.Token.RefreshToken == liveTok.RefreshToken {
+			return p.Name
+		}
+	}
+	return ""
+}
+
+// LiveWasClobbered reports true if Current() is set and a live credential exists
+// with a different refresh token than the recorded active profile.
+func (m *Manager) LiveWasClobbered() (bool, string) {
+	cur, err := m.Current()
+	if err != nil || cur == "" {
+		return false, ""
+	}
+	profData, err := os.ReadFile(m.profilePath(cur))
+	if err != nil {
+		return false, ""
+	}
+	profTok, err := parseCredential(profData)
+	if err != nil || profTok.RefreshToken == "" {
+		return false, ""
+	}
+	liveData, err := m.store.ReadLive()
+	if err != nil {
+		return false, ""
+	}
+	liveTok, err := parseCredential(liveData)
+	if err != nil || liveTok.RefreshToken == "" {
+		return false, ""
+	}
+	if liveTok.RefreshToken != profTok.RefreshToken {
+		return true, cur
+	}
+	return false, ""
+}
+
+// UpdateToken updates an existing profile file with refreshed token JSON.
+func (m *Manager) UpdateToken(name string, data []byte) error {
+	if err := util.ValidateName(name); err != nil {
+		return err
+	}
+	if _, err := parseCredential(data); err != nil {
+		return err
+	}
+	return m.Transaction(context.Background(), func(tx *Manager) error {
+		target := tx.profilePath(name)
+		if _, err := os.Stat(target); err != nil {
+			return err
+		}
+		return tx.writeFile(target, data, 0600)
+	})
 }

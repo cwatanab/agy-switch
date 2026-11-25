@@ -75,7 +75,10 @@ func TestCLI_LsCommand(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpDir, "quota_cache.json"), cache, 0600); err != nil {
 		t.Fatal(err)
 	}
-	rootCmd := cli.NewCommand(paths, cli.Dependencies{TokenStore: keyring.NewFileStore(paths)})
+	rootCmd := cli.NewCommand(paths, cli.Dependencies{
+		TokenStore:      keyring.NewFileStore(paths),
+		DisableNetCheck: true,
+	})
 
 	buf := new(bytes.Buffer)
 	rootCmd.SetOut(buf)

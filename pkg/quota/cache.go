@@ -35,6 +35,25 @@ func (c *Client) CachedAll() map[string]QuotaInfo {
 	return snapshot
 }
 
+// CachedBatch loads cached quotas for the given emails in one lock acquisition
+// without cloning the full cache map.
+func (c *Client) CachedBatch(emails []string) ([]QuotaInfo, []bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if err := c.reloadCache(); err != nil || len(emails) == 0 {
+		return nil, nil
+	}
+	infos := make([]QuotaInfo, len(emails))
+	found := make([]bool, len(emails))
+	for i, email := range emails {
+		if info, ok := c.cache[email]; ok {
+			infos[i] = info
+			found[i] = true
+		}
+	}
+	return infos, found
+}
+
 func (c *Client) readCached(email string, allowStale bool) (*QuotaInfo, bool) {
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ZhangNy301/agy-switch/pkg/config"
@@ -154,5 +155,114 @@ func TestInstallAndUninstallShim(t *testing.T) {
 	filesAfter, _ := os.ReadDir(binDir)
 	if len(filesAfter) != 0 {
 		t.Errorf("expected binDir empty after uninstall, got %v", filesAfter)
+	}
+}
+
+func TestBuildProxyEnv_RespectsExistingEnv(t *testing.T) {
+	paths := &config.Paths{DataDir: t.TempDir()}
+	store := proxy.NewStore(paths)
+	if err := store.Save(proxy.Config{Name: "p1", Server: "proxy.local", Port: 8080, Protocol: "http", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTP_PROXY", "http://user-shell:3128")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("http_proxy", "")
+	t.Setenv("https_proxy", "")
+	t.Setenv("all_proxy", "")
+
+	env, err := shim.BuildProxyEnv(paths, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "HTTP_PROXY=") {
+			t.Fatalf("existing HTTP_PROXY should not be overridden, got %s", entry)
+		}
+	}
+	foundHTTPS := false
+	for _, entry := range env {
+		if entry == "HTTPS_PROXY=http://proxy.local:8080" {
+			foundHTTPS = true
+		}
+	}
+	if !foundHTTPS {
+		t.Fatalf("expected HTTPS_PROXY to be filled, got %v", env)
+	}
+}
+
+func TestBuildProxyEnv_SOCKSFallbackOnBridgeFailure(t *testing.T) {
+	paths := &config.Paths{DataDir: t.TempDir(), BridgeLog: filepath.Join(t.TempDir(), "bridge.log")}
+	store := proxy.NewStore(paths)
+	if err := store.Save(proxy.Config{
+		Name: "socks", Server: "127.0.0.1", Port: 1080, Protocol: "socks5h",
+		Username: "alice", Password: "secret", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("http_proxy", "")
+	t.Setenv("https_proxy", "")
+	t.Setenv("all_proxy", "")
+
+	orig := shim.SetEnsureBridgeForTest(func(*config.Paths, *proxy.Config) (int, string, error) {
+		return 0, "", os.ErrPermission
+	})
+	defer shim.SetEnsureBridgeForTest(orig)
+
+	env, err := shim.BuildProxyEnv(paths, store)
+	if err != nil {
+		t.Fatalf("expected fallback instead of error, got %v", err)
+	}
+	found := false
+	for _, entry := range env {
+		if entry == "HTTPS_PROXY=socks5h://alice:secret@127.0.0.1:1080" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected raw socks5h fallback URL, got %v", env)
+	}
+}
+
+func TestRepairRestoresOverwrittenShim(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell fixture")
+	}
+	dir := t.TempDir()
+	paths := &config.Paths{DataDir: dir, BinDir: filepath.Join(dir, "bin")}
+	if err := config.EnsureDirs(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := proxy.NewStore(paths)
+	if err := store.Save(proxy.Config{Name: "p1", Server: "127.0.0.1", Port: 8080, Protocol: "http", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	shimPath := filepath.Join(paths.BinDir, "agy")
+	realPath := shimPath + ".real"
+	if err := os.WriteFile(shimPath, []byte("v1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := shim.Install(paths, shimPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetShimPaths(shimPath, realPath); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate `agy update` overwriting shimPath with v2 binary
+	if err := os.WriteFile(shimPath, []byte("v2"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := shim.Repair(paths, store); err != nil {
+		t.Fatalf("Repair failed: %v", err)
+	}
+	if !shim.IsShim(shimPath) {
+		t.Fatal("expected shimPath to be restored as shim")
+	}
+	gotReal, err := os.ReadFile(realPath)
+	if err != nil || string(gotReal) != "v2" {
+		t.Fatalf("expected updated binary at %s, got %q (%v)", realPath, gotReal, err)
 	}
 }
