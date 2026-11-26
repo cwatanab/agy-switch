@@ -296,3 +296,17 @@ func TestClient_Fetch_SkipsLoadCodeAssistWhenTierCachedAndRetriesGRPC14(t *testi
 		t.Fatalf("expected loadCodeAssist call on force=true, got loadCalls=%d tier=%s", loadCalls.Load(), infoForced.Tier)
 	}
 }
+
+func TestNewClient_DefaultsToAICode(t *testing.T) {
+	client := NewClient(&config.Paths{DataDir: t.TempDir()})
+	if client.aicodeURL != DefaultAICodeURL {
+		t.Fatalf("expected default aicodeURL %q, got %q", DefaultAICodeURL, client.aicodeURL)
+	}
+	if client.baseURL != DefaultBaseURL {
+		t.Fatalf("expected default baseURL %q, got %q", DefaultBaseURL, client.baseURL)
+	}
+	client.SetBaseURL("http://example.invalid")
+	if client.aicodeURL != "" {
+		t.Fatalf("expected SetBaseURL to clear aicodeURL, got %q", client.aicodeURL)
+	}
+}

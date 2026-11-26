@@ -212,7 +212,7 @@ type endpointResult struct {
 	err  error
 }
 
-func (c *Client) fetchEndpoints(ctx context.Context, accessToken, project string) []endpointResult {
+func (c *Client) fetchEndpoints(ctx context.Context, accessToken, project string, includeLoad bool) []endpointResult {
 	loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
 	quotaBody := map[string]interface{}{}
 	if project != "" {
@@ -229,6 +229,9 @@ func (c *Client) fetchEndpoints(ctx context.Context, accessToken, project string
 	results := make([]endpointResult, len(calls))
 	var wg sync.WaitGroup
 	for i, call := range calls {
+		if i == 0 && !includeLoad {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -295,6 +298,7 @@ func (c *Client) fetchNetwork(ctx context.Context, tok *profile.Token, force boo
 	var results []endpointResult
 	needTier := force || cachedTier == "" || cachedTier == "?"
 
+	needLoad := force || cachedTier == "" || cachedTier == "?" || cachedProject == ""
 	if c.aicodeURL != "" {
 		loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
 		runPrimary := func() {
@@ -322,13 +326,13 @@ func (c *Client) fetchNetwork(ctx context.Context, tok *profile.Token, force boo
 			runPrimary()
 		}
 	} else {
-		results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject)
+		results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject, needLoad)
 		if !refreshed && tok.RefreshToken != "" && hasUnauthorizedError(results) {
 			if err := c.refreshAccessToken(ctx, tok); err != nil {
 				return c.cachedFailure(tok.Email, err)
 			}
 			refreshed = true
-			results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject)
+			results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject, needLoad)
 		}
 		loadRes = results[0]
 	}
@@ -411,6 +415,18 @@ func (c *Client) fetchNetwork(ctx context.Context, tok *profile.Token, force boo
 		applyModelsAt(info, results[2].data, time.Now())
 		hasAnyQuota = info.HasGemini || info.HasClaude || info.HasGeminiWeekly || info.HasClaudeWeekly
 	} else if c.aicodeURL == "" {
+		if !needLoad && (isForbiddenError(results[1].err) || isForbiddenError(results[2].err)) {
+			loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
+			results[0].data, results[0].err = c.postJSON(ctx, tok.AccessToken, "/v1internal:loadCodeAssist", loadBody)
+			loadRes = results[0]
+			if results[0].data != nil {
+				applyTier(info, results[0].data)
+				if p, ok := results[0].data["cloudaicompanionProject"].(string); ok && p != "" {
+					project = p
+					info.Project = p
+				}
+			}
+		}
 		if project != "" && project != cachedProject &&
 			(isForbiddenError(results[1].err) || isForbiddenError(results[2].err)) {
 			c.retryQuotaWithProject(ctx, tok.AccessToken, project, results)

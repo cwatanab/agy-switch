@@ -83,7 +83,7 @@ func (c *Client) fetchAICodeQuotaOnce(ctx context.Context, accessToken string) (
 	req.Header.Set("TE", "trailers")
 	req.Header.Set("Grpc-Accept-Encoding", "identity,gzip")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", "antigravity/1.2.9")
+	req.Header.Set("User-Agent", quotaUserAgent())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -50,16 +50,28 @@ func applySummary(info *QuotaInfo, qs map[string]interface{}) {
 					if !ok {
 						continue
 					}
-					window := fmt.Sprintf("%v", bMap["window"])
+					window := strings.ToLower(fmt.Sprintf("%v", bMap["window"]))
+					bucketID := strings.ToLower(fmt.Sprintf("%v", bMap["bucketId"]))
+					if window == "" || window == "<nil>" {
+						if strings.HasSuffix(bucketID, "-5h") {
+							window = "5h"
+						} else if strings.HasSuffix(bucketID, "-weekly") {
+							window = "weekly"
+						}
+					}
 					var frac float64
 					if f, ok := bMap["remainingFraction"].(float64); ok {
 						frac = f
 					}
 					reset, _ := bMap["resetTime"].(string)
 					desc, _ := bMap["description"].(string)
-					disabled := window == "5h" && strings.Contains(strings.ToLower(desc), "does not currently apply")
+					boolDisabled, _ := bMap["disabled"].(bool)
+					disabled := boolDisabled || (window == "5h" && strings.Contains(strings.ToLower(desc), "does not currently apply"))
 
-					if strings.Contains(name, "gemini") {
+					isGemini := strings.Contains(name, "gemini") || strings.HasPrefix(bucketID, "gemini-")
+					isClaude := strings.Contains(name, "claude") || strings.HasPrefix(bucketID, "3p-")
+
+					if isGemini {
 						if window == "5h" {
 							info.Gemini5hFraction = frac
 							info.Gemini5hReset = reset
@@ -73,7 +85,7 @@ func applySummary(info *QuotaInfo, qs map[string]interface{}) {
 							info.WeeklyFraction = frac
 							info.WeeklyReset = reset
 						}
-					} else if strings.Contains(name, "claude") {
+					} else if isClaude {
 						if window == "5h" {
 							info.Claude5hFraction = frac
 							info.Claude5hReset = reset

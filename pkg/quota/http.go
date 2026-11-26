@@ -10,9 +10,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"time"
 )
+
+const defaultUserAgentVersion = "1.5.18"
+
+func quotaUserAgent() string {
+	return fmt.Sprintf("antigravity/%s (os_type=%s; arch=%s)", defaultUserAgentVersion, runtime.GOOS, runtime.GOARCH)
+}
 
 func (c *Client) postJSON(ctx context.Context, token, path string, body interface{}) (map[string]interface{}, error) {
 	var data []byte
@@ -23,7 +30,8 @@ func (c *Client) postJSON(ctx context.Context, token, path string, body interfac
 			return nil, err
 		}
 	}
-	headers := http.Header{"Authorization": {"Bearer " + token}, "Content-Type": {"application/json"}, "User-Agent": {"antigravity/1.2.9"}}
+	ua := quotaUserAgent()
+	headers := http.Header{"Authorization": {"Bearer " + token}, "Content-Type": {"application/json"}, "User-Agent": {ua}}
 	return c.requestJSON(ctx, c.baseURL+path, data, headers)
 }
 
