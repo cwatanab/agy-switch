@@ -27,6 +27,7 @@ type Dependencies struct {
 	RunProcess        func(*exec.Cmd) error
 	FindAgy           func(*config.Paths) (string, error)
 	LaunchAgy         func(*config.Paths, []string) (int, error)
+	StartAgy          func(*config.Paths, []string) error
 	IsTTY             func() bool
 	CountAgyProcesses func() (int, error)
 	NetCheck          func(context.Context) (string, string)
@@ -67,6 +68,9 @@ func newApp(paths *config.Paths, deps Dependencies) *app {
 	if deps.LaunchAgy == nil {
 		deps.LaunchAgy = shim.ExecuteRealAgy
 	}
+	if deps.StartAgy == nil {
+		deps.StartAgy = shim.StartRealAgy
+	}
 	if deps.IsTTY == nil {
 		deps.IsTTY = defaultIsTTY
 	}
@@ -78,7 +82,14 @@ func newApp(paths *config.Paths, deps Dependencies) *app {
 		deps:     deps,
 		profiles: profile.NewManager(paths, deps.TokenStore),
 		proxies:  proxies,
-		quota:    quota.NewClientWithOptions(paths, quota.Options{HTTPClient: deps.HTTPClient, FindAgy: deps.FindAgy}),
+		quota: quota.NewClientWithOptions(paths, quota.Options{
+			HTTPClient: deps.HTTPClient,
+			TokenStore: deps.TokenStore,
+			FindAgy:    deps.FindAgy,
+			ProxyEnv: func() ([]string, error) {
+				return shim.BuildProxyEnv(paths, proxies)
+			},
+		}),
 	}
 }
 

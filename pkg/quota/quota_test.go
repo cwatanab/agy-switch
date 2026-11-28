@@ -3,11 +3,14 @@ package quota_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,56 +23,16 @@ import (
 )
 
 func TestClient_Fetch_SuccessAndCache(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1internal:loadCodeAssist":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"paidTier": map[string]interface{}{
-					"id":   "tier-pro-annual",
-					"name": "Pro",
-				},
-			})
-		case "/v1internal:retrieveUserQuotaSummary":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"groups": []interface{}{
-					map[string]interface{}{
-						"displayName": "Gemini",
-						"buckets": []interface{}{
-							map[string]interface{}{
-								"window":            "5h",
-								"remainingFraction": 0.85,
-								"resetTime":         "2026-11-17T18:00:00Z",
-							},
-							map[string]interface{}{
-								"window":            "weekly",
-								"remainingFraction": 0.50,
-							},
-						},
-					},
-					map[string]interface{}{
-						"displayName": "Claude",
-						"buckets": []interface{}{
-							map[string]interface{}{
-								"window":            "5h",
-								"remainingFraction": 0.90,
-							},
-						},
-					},
-				},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
+	jsonPayload := `spinner...
+{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.688,"reset_time":"2026-12-03T07:02:37Z","description":"You have hit your 5-hour limit, so the weekly limit does not currently apply."},{"id":"gemini-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-11-28T04:21:31Z","description":"You have hit your 5-hour limit"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-weekly","window":"weekly","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"},{"id":"3p-5h","window":"5h","remaining_fraction":0.85,"reset_time":"2026-11-28T06:00:00Z"}]}]}}}`
 
-	tmpDir := t.TempDir()
-	paths := &config.Paths{
-		DataDir: tmpDir,
-	}
-
-	client := quota.NewClient(paths)
-	client.SetBaseURL(server.URL)
+	var calls int
+	client := quota.NewClientWithOptions(&config.Paths{DataDir: t.TempDir()}, quota.Options{
+		RunUsage: func(ctx context.Context, tok *profile.Token) ([]byte, *profile.Token, error) {
+			calls++
+			return []byte(jsonPayload), nil, nil
+		},
+	})
 
 	tok := &profile.Token{
 		AccessToken: "test-token",
@@ -80,274 +43,131 @@ func TestClient_Fetch_SuccessAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
+	if !qInfo.HasGemini || qInfo.Gemini5hFraction != 0 || qInfo.Gemini5hDisabled {
+		t.Fatalf("unexpected Gemini 5h: %+v", qInfo)
+	}
+	if !qInfo.HasGeminiWeekly || math.Abs(qInfo.GeminiWeeklyFraction-0.688) > 1e-6 || qInfo.GeminiWeeklyDisabled {
+		t.Fatalf("unexpected Gemini weekly: %+v", qInfo)
+	}
+	if !qInfo.HasClaude || math.Abs(qInfo.Claude5hFraction-0.85) > 1e-6 {
+		t.Fatalf("unexpected Claude 5h: %+v", qInfo)
+	}
+	if !qInfo.HasClaudeWeekly || qInfo.ClaudeWeeklyFraction != 1.0 || qInfo.ClaudeWeeklyReset != "" {
+		t.Fatalf("expected 1970 reset_time stripped on Claude weekly, got %+v", qInfo)
+	}
 
-	if qInfo.Tier != "Pro" {
-		t.Errorf("expected Pro tier, got %s", qInfo.Tier)
-	}
-	if qInfo.Gemini5hFraction != 0.85 {
-		t.Errorf("expected 0.85 Gemini 5h, got %f", qInfo.Gemini5hFraction)
-	}
-	if qInfo.WeeklyFraction != 0.50 {
-		t.Errorf("expected 0.50 Weekly, got %f", qInfo.WeeklyFraction)
-	}
-	if qInfo.Claude5hFraction != 0.90 {
-		t.Errorf("expected 0.90 Claude 5h, got %f", qInfo.Claude5hFraction)
-	}
-
-	// Second fetch without forceRefresh should read from cache
-	server.Close() // close server so network would fail
+	// Second fetch without force uses cache without calling RunUsage.
 	cachedInfo, err := client.Fetch(tok, false)
 	if err != nil {
 		t.Fatalf("cached fetch failed: %v", err)
 	}
-	if cachedInfo.Tier != "Pro" {
-		t.Errorf("expected cached Pro tier, got %s", cachedInfo.Tier)
+	if calls != 1 {
+		t.Fatalf("expected 1 RunUsage call (cache hit on 2nd), got %d", calls)
+	}
+	if math.Abs(cachedInfo.GeminiWeeklyFraction-0.688) > 1e-6 {
+		t.Fatalf("unexpected cached weekly: %+v", cachedInfo)
+	}
+
+	// ClearCached forces next fetch to invoke RunUsage.
+	if err := client.ClearCached(tok.Email); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Fetch(tok, false); err != nil {
+		t.Fatalf("fetch after ClearCached failed: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 RunUsage calls after ClearCached, got %d", calls)
 	}
 }
 
-func TestClient_Fetch_InvalidJSONHandled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`corrupted-not-json`))
-	}))
-	defer server.Close()
-
-	tmpDir := t.TempDir()
-	paths := &config.Paths{
-		DataDir: tmpDir,
-	}
-
-	client := quota.NewClient(paths)
-	client.SetBaseURL(server.URL)
-
-	tok := &profile.Token{
-		AccessToken: "test-token",
-		Email:       "corrupt@example.com",
-	}
-
-	qInfo, err := client.Fetch(tok, true)
-	// Should not panic, returns error or empty tier
-	if err == nil && qInfo.Tier != "?" {
-		t.Errorf("expected error or unknown tier, got %v", qInfo)
-	}
-}
-
-func TestClient_Fetch_PerModelRetrieveUserQuota(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1internal:loadCodeAssist":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"paidTier": map[string]interface{}{
-					"id":   "g1-pro-tier",
-					"name": "Google AI Pro",
-				},
-			})
-		case "/v1internal:retrieveUserQuotaSummary":
-			// Real Google API: only Claude & GPT models returned here
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"groups": []interface{}{
-					map[string]interface{}{
-						"displayName": "Claude and GPT models",
-						"buckets": []interface{}{
-							map[string]interface{}{
-								"window":            "weekly",
-								"remainingFraction": 0.99,
-							},
-						},
-					},
-				},
-			})
-		case "/v1internal:retrieveUserQuota":
-			// Real Google API: Gemini models returned here!
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"buckets": []interface{}{
-					map[string]interface{}{
-						"modelId":           "gemini-2.5-pro",
-						"remainingFraction": 0.325,
-						"resetTime":         "2026-11-17T06:05:00Z",
-					},
-					map[string]interface{}{
-						"modelId":           "claude-sonnet-5-5-medium",
-						"remainingFraction": 1.0,
-						"resetTime":         "2026-11-17T10:53:30Z",
-					},
-				},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	tmpDir := t.TempDir()
-	paths := &config.Paths{
-		DataDir: tmpDir,
-	}
-
-	client := quota.NewClient(paths)
-	client.SetBaseURL(server.URL)
-
-	tok := &profile.Token{
-		AccessToken: "test-token",
-		Email:       "gemini-user@example.com",
-	}
-
-	qInfo, err := client.Fetch(tok, true)
+func TestClient_Fetch_Disabled5hFlag(t *testing.T) {
+	jsonPayload := `{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":1,"description":"You have hit your weekly limit, the 5-hour limit does not currently apply"},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-12-03T07:00:00Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":0.8,"disabled":true},{"id":"3p-weekly","window":"weekly","remaining_fraction":0.5,"reset_time":"2026-12-03T07:00:00Z"}]}]}}}`
+	client := quota.NewClientWithOptions(&config.Paths{DataDir: t.TempDir()}, quota.Options{
+		RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+			return []byte(jsonPayload), nil, nil
+		},
+	})
+	info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "disabled@example.com"}, true)
 	if err != nil {
-		t.Fatalf("fetch failed: %v", err)
+		t.Fatal(err)
 	}
-
-	if qInfo.Tier != "Pro" {
-		t.Errorf("expected Pro tier, got %s", qInfo.Tier)
+	if !info.Gemini5hDisabled || !info.Claude5hDisabled {
+		t.Fatalf("expected Gemini5hDisabled and Claude5hDisabled true, got %+v", info)
 	}
-	if !qInfo.HasGemini {
-		t.Errorf("expected HasGemini true")
-	}
-	if qInfo.Gemini5hFraction != 0.325 {
-		t.Errorf("expected 0.325 Gemini 5h, got %f", qInfo.Gemini5hFraction)
-	}
-	if !qInfo.HasClaude {
-		t.Errorf("expected HasClaude true")
-	}
-	if qInfo.Claude5hFraction != 1.0 {
-		t.Errorf("expected 1.0 Claude 5h, got %f", qInfo.Claude5hFraction)
-	}
-	if qInfo.WeeklyFraction != 0.99 {
-		t.Errorf("expected 0.99 Weekly, got %f", qInfo.WeeklyFraction)
-	}
-
-	// Verify ClearCached
-	client.ClearCached("gemini-user@example.com")
-	// Subsequent read without forceRefresh should miss cache and attempt fetch, but server is now closed
-	server.Close()
-	_, err = client.Fetch(tok, false)
-	if err == nil {
-		t.Errorf("expected error or cache miss after ClearCached, but got none")
+	if info.GeminiWeeklyDisabled || info.ClaudeWeeklyDisabled {
+		t.Fatalf("expected weekly not disabled, got %+v", info)
 	}
 }
 
 func TestClient_Fetch_DoesNotOverwriteCacheWithIncompleteQuota(t *testing.T) {
-	t.Run("preserves valid cache when quota endpoints fail", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"paidTier": map[string]interface{}{"id": "starter", "name": "Antigravity Starter Quota"},
-				})
-			default:
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-		}))
-		defer server.Close()
+	validJSON := `{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.75}]}]}}}`
 
+	t.Run("preserves valid cache when RunUsage fails", func(t *testing.T) {
 		paths := &config.Paths{DataDir: t.TempDir()}
-		// Seed valid cache via an initial full response.
-		seedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "pro-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{map[string]interface{}{
-						"displayName": "Gemini",
-						"buckets":     []interface{}{map[string]interface{}{"window": "5h", "remainingFraction": 0.75}},
-					}},
-				})
-			default:
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-			}
-		}))
-		defer seedServer.Close()
-
-		client := quota.NewClient(paths)
-		client.SetBaseURL(seedServer.URL)
+		var fail bool
+		client := quota.NewClientWithOptions(paths, quota.Options{
+			RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+				if fail {
+					return nil, nil, errors.New("agy failed")
+				}
+				return []byte(validJSON), nil, nil
+			},
+		})
 		tok := &profile.Token{AccessToken: "tok", Email: "user@example.com"}
 		if _, err := client.Fetch(tok, true); err != nil {
 			t.Fatalf("seed fetch failed: %v", err)
 		}
 
-		client.SetBaseURL(server.URL)
+		fail = true
 		info, err := client.Fetch(tok, true)
 		if err == nil {
-			t.Fatal("expected error when quota endpoints fail")
+			t.Fatal("expected error when RunUsage fails")
 		}
 		if info == nil || !info.HasGemini || info.Gemini5hFraction != 0.75 {
 			t.Fatalf("expected preserved cached quota, got %+v", info)
 		}
 		cached, ok := client.Cached(tok.Email)
-		if !ok || !cached.HasGemini || cached.Gemini5hFraction != 0.75 || cached.Tier != "Pro" {
-			t.Fatalf("disk cache overwritten with incomplete quota: %+v", cached)
+		if !ok || !cached.HasGemini || cached.Gemini5hFraction != 0.75 {
+			t.Fatalf("disk cache overwritten: %+v", cached)
 		}
 	})
 
-	t.Run("preserves valid cache when quota endpoints return empty", func(t *testing.T) {
+	t.Run("preserves valid cache when groups are empty", func(t *testing.T) {
 		paths := &config.Paths{DataDir: t.TempDir()}
-		seedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "pro-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{map[string]interface{}{
-						"displayName": "Gemini",
-						"buckets":     []interface{}{map[string]interface{}{"window": "5h", "remainingFraction": 0.75}},
-					}},
-				})
-			default:
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-			}
-		}))
-		defer seedServer.Close()
-
-		emptyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/v1internal:loadCodeAssist" {
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"paidTier": map[string]interface{}{"id": "starter", "name": "Antigravity Starter Quota"},
-				})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-		}))
-		defer emptyServer.Close()
-
-		client := quota.NewClient(paths)
-		client.SetBaseURL(seedServer.URL)
+		var empty bool
+		client := quota.NewClientWithOptions(paths, quota.Options{
+			RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+				if empty {
+					return []byte(`{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}`), nil, nil
+				}
+				return []byte(validJSON), nil, nil
+			},
+		})
 		tok := &profile.Token{AccessToken: "tok", Email: "user@example.com"}
 		if _, err := client.Fetch(tok, true); err != nil {
 			t.Fatalf("seed fetch failed: %v", err)
 		}
 
-		client.SetBaseURL(emptyServer.URL)
+		empty = true
 		info, err := client.Fetch(tok, true)
 		if err == nil {
-			t.Fatal("expected error when quota response drops model usage data")
+			t.Fatal("expected error when /usage returns no quota data")
 		}
 		if info == nil || info.Gemini5hFraction != 0.75 {
 			t.Fatalf("expected preserved cached quota, got %+v", info)
 		}
-		if cached, ok := client.Cached(tok.Email); !ok || cached.Gemini5hFraction != 0.75 {
-			t.Fatalf("disk cache was overwritten: %+v", cached)
-		}
 	})
 
-	t.Run("does not cache tier-only result when quota endpoints fail on empty cache", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/v1internal:loadCodeAssist" {
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"paidTier": map[string]interface{}{"id": "starter", "name": "Antigravity Starter Quota"},
-				})
-				return
-			}
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer server.Close()
-
+	t.Run("does not cache on failure when cache is empty", func(t *testing.T) {
 		paths := &config.Paths{DataDir: t.TempDir()}
-		client := quota.NewClient(paths)
-		client.SetBaseURL(server.URL)
+		client := quota.NewClientWithOptions(paths, quota.Options{
+			RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+				return []byte(`not-json`), nil, nil
+			},
+		})
 		tok := &profile.Token{AccessToken: "tok", Email: "nocache@example.com"}
-		if _, err := client.FetchContext(context.Background(), tok, true); err == nil {
-			t.Fatal("expected error when quota endpoints fail")
+		if _, err := client.Fetch(tok, true); err == nil {
+			t.Fatal("expected error on invalid JSON")
 		}
 		if cached, ok := client.Cached(tok.Email); ok {
 			t.Fatalf("expected no cached entry, got %+v", cached)
@@ -355,438 +175,283 @@ func TestClient_Fetch_DoesNotOverwriteCacheWithIncompleteQuota(t *testing.T) {
 	})
 }
 
-func TestClient_Fetch_RetriesQuotaWithProjectOn403(t *testing.T) {
-	var forbiddenCount atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1internal:loadCodeAssist":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"cloudaicompanionProject": "proj-123",
-				"paidTier": map[string]interface{}{
-					"id":   "free-tier",
-					"name": "Antigravity Starter Quota",
-				},
-			})
-		case "/v1internal:retrieveUserQuotaSummary":
-			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["project"] != "proj-123" {
-				forbiddenCount.Add(1)
-				w.WriteHeader(http.StatusForbidden)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"groups": []interface{}{
-					map[string]interface{}{
-						"displayName": "Claude and GPT models",
-						"buckets": []interface{}{
-							map[string]interface{}{"window": "weekly", "remainingFraction": 0.9},
-						},
-					},
-				},
-			})
-		case "/v1internal:retrieveUserQuota":
-			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["project"] != "proj-123" {
-				forbiddenCount.Add(1)
-				w.WriteHeader(http.StatusForbidden)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"buckets": []interface{}{
-					map[string]interface{}{"modelId": "gemini-2.5-pro", "remainingFraction": 0.4},
-					map[string]interface{}{"modelId": "claude-sonnet-4-6", "remainingFraction": 1.0},
-				},
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
+func TestClient_Fetch_PropagatesRefreshedToken(t *testing.T) {
+	validJSON := `{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.5}]}]}}}`
+	var callbackTok *profile.Token
+	client := quota.NewClientWithOptions(&config.Paths{DataDir: t.TempDir()}, quota.Options{
+		RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+			return []byte(validJSON), &profile.Token{
+				AccessToken:  "fresh-at",
+				RefreshToken: "fresh-rt",
+				Email:        "user@example.com",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			}, nil
+		},
+		OnTokenRefreshed: func(tok *profile.Token) {
+			callbackTok = tok
+		},
+	})
 
-	paths := &config.Paths{DataDir: t.TempDir()}
-	client := quota.NewClient(paths)
-	client.SetBaseURL(server.URL)
-
-	tok := &profile.Token{AccessToken: "tok", Email: "starter@example.com"}
-	info, err := client.Fetch(tok, true)
+	orig := &profile.Token{AccessToken: "old-at", RefreshToken: "old-rt", Email: "user@example.com"}
+	info, err := client.Fetch(orig, true)
 	if err != nil {
-		t.Fatalf("fetch failed: %v", err)
+		t.Fatalf("Fetch failed: %v", err)
 	}
-	if info.Tier != "Free" {
-		t.Fatalf("Tier=%q, want Free", info.Tier)
+	if orig.AccessToken != "old-at" {
+		t.Fatal("Fetch mutated caller's token")
 	}
-	if !info.HasGemini || info.Gemini5hFraction != 0.4 {
-		t.Fatalf("unexpected Gemini quota: %+v", info)
+	if info.RefreshedToken == nil || info.RefreshedToken.AccessToken != "fresh-at" {
+		t.Fatalf("expected RefreshedToken in QuotaInfo, got %+v", info.RefreshedToken)
 	}
-	if !info.HasClaude || info.Claude5hFraction != 1.0 {
-		t.Fatalf("unexpected Claude quota: %+v", info)
-	}
-	if info.Project != "proj-123" {
-		t.Fatalf("Project=%q, want proj-123", info.Project)
-	}
-
-	forbiddenCount.Store(0)
-	if _, err := client.Fetch(tok, true); err != nil {
-		t.Fatalf("second forced fetch failed: %v", err)
-	}
-	if got := forbiddenCount.Load(); got != 0 {
-		t.Fatalf("expected cached project to avoid 403 retries on second fetch, got %d 403s", got)
+	if callbackTok == nil || callbackTok.AccessToken != "fresh-at" {
+		t.Fatalf("expected OnTokenRefreshed callback, got %+v", callbackTok)
 	}
 }
 
-func TestClient_Fetch_SeparateWeeklyAndDisabledBuckets(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1internal:loadCodeAssist":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "pro-tier"}})
-		case "/v1internal:retrieveUserQuotaSummary":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"groups": []interface{}{
-					map[string]interface{}{
-						"displayName": "Gemini",
-						"buckets": []interface{}{
-							map[string]interface{}{
-								"window":            "5h",
-								"remainingFraction": 1.0,
-								"description":       "You have hit your weekly limit, the 5-hour limit does not currently apply",
-							},
-							map[string]interface{}{
-								"window":            "weekly",
-								"remainingFraction": 0.0,
-								"resetTime":         "2026-11-30T00:00:00Z",
-							},
-						},
-					},
-					map[string]interface{}{
-						"displayName": "Claude",
-						"buckets": []interface{}{
-							map[string]interface{}{
-								"window":            "5h",
-								"remainingFraction": 0.65,
-								"resetTime":         "2026-11-25T18:00:00Z",
-							},
-							map[string]interface{}{
-								"window":            "weekly",
-								"remainingFraction": 0.42,
-								"resetTime":         "2026-12-01T00:00:00Z",
-							},
-						},
-					},
-				},
-			})
-		default:
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-		}
-	}))
-	defer server.Close()
+func TestClient_RunAgyUsage_IsolatedHomeAndTokenRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell fixture")
+	}
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args.txt")
+	homeFile := filepath.Join(dir, "home.txt")
+	permFile := filepath.Join(dir, "perm.txt")
+	script := filepath.Join(dir, "mock-agy")
+	scriptBody := `#!/bin/sh
+printf '%s\n' "$@" > "$TEST_ARGS_FILE"
+printf '%s' "$HOME" > "$TEST_HOME_FILE"
+TOK="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+ls -l "$TOK" > "$TEST_PERM_FILE"
+cat <<'JSON' > "$TOK"
+{"auth_method":"consumer","id_token_email":"iso@example.com","token":{"access_token":"refreshed-by-agy","refresh_token":"rt-1","expiry":"2099-01-01T00:00:00Z"}}
+JSON
+echo '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.42},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.84}]}]}}}'
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_ARGS_FILE", argsFile)
+	t.Setenv("TEST_HOME_FILE", homeFile)
+	t.Setenv("TEST_PERM_FILE", permFile)
 
-	client := quota.NewClient(&config.Paths{DataDir: t.TempDir()})
-	client.SetBaseURL(server.URL)
-	info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "weekly@example.com"}, true)
+	// Set a sentinel live HOME to prove runAgyUsage does not touch it.
+	realHome := filepath.Join(dir, "real-home")
+	if err := os.MkdirAll(realHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", realHome)
+
+	paths := &config.Paths{DataDir: filepath.Join(dir, "data")}
+	client := quota.NewClientWithOptions(paths, quota.Options{
+		FindAgy: func(*config.Paths) (string, error) { return script, nil },
+		ProxyEnv: func() ([]string, error) {
+			return []string{"HTTPS_PROXY=http://127.0.0.1:8888"}, nil
+		},
+	})
+
+	tok := &profile.Token{AccessToken: "old-at", RefreshToken: "rt-1", Email: "iso@example.com"}
+	info, err := client.Fetch(tok, true)
+	if err != nil {
+		t.Fatalf("Fetch with mock agy failed: %v", err)
+	}
+	if math.Abs(info.Gemini5hFraction-0.42) > 1e-6 || math.Abs(info.GeminiWeeklyFraction-0.84) > 1e-6 {
+		t.Fatalf("unexpected fractions: %+v", info)
+	}
+	if info.RefreshedToken == nil || info.RefreshedToken.AccessToken != "refreshed-by-agy" {
+		t.Fatalf("expected refreshed token from isolated file, got %+v", info.RefreshedToken)
+	}
+
+	gotArgs, err := os.ReadFile(argsFile)
+	if err != nil || string(gotArgs) != "--output-format\njson\n-p\n/usage\n" {
+		t.Fatalf("unexpected agy args: %q (%v)", gotArgs, err)
+	}
+	gotHome, err := os.ReadFile(homeFile)
+	if err != nil || string(gotHome) == realHome {
+		t.Fatalf("agy used real HOME instead of isolated temp dir: %q", gotHome)
+	}
+	if _, err := os.Stat(string(gotHome)); !os.IsNotExist(err) {
+		t.Fatalf("expected isolated temp home %q to be cleaned up", gotHome)
+	}
+	if gotPerm, err := os.ReadFile(permFile); err != nil || !strings.HasPrefix(string(gotPerm), "-rw-------") {
+		t.Fatalf("expected 0600 token permissions, got %q (%v)", gotPerm, err)
+	}
+}
+
+type mockKeyringStore struct {
+	mu         sync.Mutex
+	path       string
+	writeCalls atomic.Int32
+}
+
+func (m *mockKeyringStore) ReadLive() ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return os.ReadFile(m.path)
+}
+
+func (m *mockKeyringStore) WriteLive(data []byte) error {
+	m.writeCalls.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return os.WriteFile(m.path, data, 0600)
+}
+
+func (m *mockKeyringStore) DeleteLive() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := os.Remove(m.path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func TestClient_RunAgyUsage_KeyringSwapSerializesAndRestores(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell fixture")
+	}
+	dir := t.TempDir()
+	keyringPath := filepath.Join(dir, "keyring-live.json")
+	origLive := `{"auth_method":"consumer","id_token_email":"live@example.com","token":{"access_token":"at-live","refresh_token":"rt-live","expiry":"2099-01-01T00:00:00Z"}}`
+	if err := os.WriteFile(keyringPath, []byte(origLive), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockKeyringStore{path: keyringPath}
+
+	script := filepath.Join(dir, "mock-agy-keyring")
+	scriptBody := `#!/bin/sh
+# Simulate agy reading OS keyring instead of $HOME token file.
+DATA=$(cat "$TEST_KEYRING_FILE")
+case "$DATA" in
+  *rt-1*)
+    cat <<'JSON' > "$TEST_KEYRING_FILE"
+{"auth_method":"consumer","id_token_email":"a1@example.com","token":{"access_token":"refreshed-at-1","refresh_token":"rt-1","expiry":"2099-01-01T00:00:00Z"}}
+JSON
+    echo '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.11},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.21}]}]}}}'
+    ;;
+  *rt-2*)
+    echo '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.22},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.32}]}]}}}'
+    ;;
+  *rt-live*)
+    echo '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.99},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.88}]}]}}}'
+    ;;
+  *)
+    echo '{"status":"ERROR"}'
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_KEYRING_FILE", keyringPath)
+
+	useSwap := true
+	paths := &config.Paths{DataDir: filepath.Join(dir, "data")}
+	client := quota.NewClientWithOptions(paths, quota.Options{
+		TokenStore:     store,
+		UseKeyringSwap: &useSwap,
+		FindAgy:        func(*config.Paths) (string, error) { return script, nil },
+	})
+
+	tokLive := &profile.Token{AccessToken: "at-live", RefreshToken: "rt-live", Email: "live@example.com"}
+	infoLiveOnly, err := client.Fetch(tokLive, true)
+	if err != nil {
+		t.Fatalf("Fetch live account failed: %v", err)
+	}
+	if math.Abs(infoLiveOnly.Gemini5hFraction-0.99) > 1e-6 {
+		t.Fatalf("unexpected live fraction: %+v", infoLiveOnly)
+	}
+	if writes := store.writeCalls.Load(); writes != 0 {
+		t.Fatalf("expected 0 keyring writes when matching live grant, got %d", writes)
+	}
+
+	tok1 := &profile.Token{AccessToken: "at-1", RefreshToken: "rt-1", Email: "a1@example.com"}
+	tok2 := &profile.Token{AccessToken: "at-2", RefreshToken: "rt-2", Email: "a2@example.com"}
+
+	var wg sync.WaitGroup
+	var res1, res2, res3 *quota.QuotaInfo
+	var err1, err2, err3 error
+	for i, fn := range []func(){
+		func() { res1, err1 = client.Fetch(tok1, true) },
+		func() { res2, err2 = client.Fetch(tok2, true) },
+		func() { res3, err3 = client.Fetch(tokLive, true) },
+	} {
+		_ = i
+		wg.Add(1)
+		go func(run func()) {
+			defer wg.Done()
+			run()
+		}(fn)
+	}
+	wg.Wait()
+
+	if err1 != nil || err2 != nil || err3 != nil {
+		t.Fatalf("concurrent keyring-swapped fetches failed: %v / %v / %v", err1, err2, err3)
+	}
+	if math.Abs(res1.Gemini5hFraction-0.11) > 1e-6 || math.Abs(res2.Gemini5hFraction-0.22) > 1e-6 || math.Abs(res3.Gemini5hFraction-0.99) > 1e-6 {
+		t.Fatalf("accounts mixed up quotas: r1=%.2f r2=%.2f r3=%.2f", res1.Gemini5hFraction, res2.Gemini5hFraction, res3.Gemini5hFraction)
+	}
+	if res1.RefreshedToken == nil || res1.RefreshedToken.AccessToken != "refreshed-at-1" {
+		t.Fatalf("expected refreshed token captured before keyring restore, got %+v", res1.RefreshedToken)
+	}
+
+	afterLive, err := store.ReadLive()
+	if err != nil || string(afterLive) != origLive {
+		t.Fatalf("live keyring was not restored: got %q (%v)", string(afterLive), err)
+	}
+}
+
+func TestClient_RevokeToken(t *testing.T) {
+	var gotBody string
+	var statusToReturn = http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(statusToReturn)
+	}))
+	defer srv.Close()
+
+	client := quota.NewClientWithOptions(&config.Paths{DataDir: t.TempDir()}, quota.Options{
+		RevokeURL: srv.URL,
+	})
+	if err := client.RevokeToken(context.Background(), "rt-xyz"); err != nil {
+		t.Fatalf("RevokeToken failed: %v", err)
+	}
+	if gotBody != "token=rt-xyz" {
+		t.Fatalf("unexpected revoke payload: %q", gotBody)
+	}
+
+	statusToReturn = http.StatusBadRequest
+	if err := client.RevokeToken(context.Background(), "rt-xyz"); err == nil {
+		t.Fatal("expected error on HTTP 400 from revoke endpoint")
+	}
+
+	if err := client.RevokeToken(context.Background(), ""); err == nil {
+		t.Fatal("expected error on empty refresh token")
+	}
+}
+
+// Verify QuotaInfo JSON roundtrip preserves expected fields.
+func TestQuotaInfo_JSONRoundTrip(t *testing.T) {
+	in := quota.QuotaInfo{
+		Tier:                 "Pro",
+		Gemini5hFraction:     0.25,
+		GeminiWeeklyFraction: 0.75,
+		HasGemini:            true,
+		HasGeminiWeekly:      true,
+		Email:                "a@b.com",
+		UpdatedAt:            time.Now().UTC().Truncate(time.Second),
+	}
+	b, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.Gemini5hDisabled || !info.HasGeminiWeekly || info.GeminiWeeklyFraction != 0.0 {
-		t.Fatalf("unexpected Gemini weekly/disabled state: %+v", info)
+	var out quota.QuotaInfo
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
 	}
-	if !info.HasClaudeWeekly || info.ClaudeWeeklyFraction != 0.42 || info.ClaudeWeeklyReset != "2026-12-01T00:00:00Z" {
-		t.Fatalf("unexpected Claude weekly state: %+v", info)
+	if out.Gemini5hFraction != 0.25 || out.GeminiWeeklyFraction != 0.75 || !out.HasGeminiWeekly {
+		t.Fatalf("roundtrip mismatch: %+v", out)
 	}
-}
-
-func TestClient_Fetch_ClassifiesWeeklyVs5hModelBuckets(t *testing.T) {
-	now := time.Now().UTC()
-	weeklyReset := now.Add(6 * 24 * time.Hour).Format(time.RFC3339)
-	fiveHourReset := now.Add(3 * time.Hour).Format(time.RFC3339)
-
-	t.Run("free tier weekly buckets go to weekly without populating 5h", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"currentTier": map[string]interface{}{"id": "free-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{
-						map[string]interface{}{
-							"displayName": "Claude and GPT models",
-							"buckets":     []interface{}{map[string]interface{}{"window": "weekly", "remainingFraction": 1.0, "resetTime": weeklyReset}},
-						},
-					},
-				})
-			case "/v1internal:retrieveUserQuota":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"buckets": []interface{}{
-						map[string]interface{}{"modelId": "gemini-2.5-flash", "remainingFraction": 0.25, "resetTime": weeklyReset},
-						map[string]interface{}{"modelId": "claude-sonnet-4-6", "remainingFraction": 0.80, "resetTime": weeklyReset},
-					},
-				})
-			default:
-				http.NotFound(w, r)
-			}
-		}))
-		defer server.Close()
-
-		client := quota.NewClient(&config.Paths{DataDir: t.TempDir()})
-		client.SetBaseURL(server.URL)
-		info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "free@example.com"}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.HasGemini {
-			t.Fatalf("expected HasGemini=false for weekly-only resetTime, got %+v", info)
-		}
-		if !info.HasGeminiWeekly || info.GeminiWeeklyFraction != 0.25 || info.GeminiWeeklyReset != weeklyReset {
-			t.Fatalf("expected GeminiWeekly populated, got %+v", info)
-		}
-		if info.HasClaude {
-			t.Fatalf("expected HasClaude=false for weekly-only resetTime, got %+v", info)
-		}
-		if !info.HasClaudeWeekly || info.ClaudeWeeklyFraction != 1.0 {
-			t.Fatalf("expected ClaudeWeekly from summary preserved, got %+v", info)
-		}
-	})
-
-	t.Run("pro tier 5h buckets go to 5h", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "g1-pro-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{
-						map[string]interface{}{
-							"displayName": "Claude and GPT models",
-							"buckets": []interface{}{
-								map[string]interface{}{"window": "5h", "remainingFraction": 1.0, "resetTime": fiveHourReset},
-								map[string]interface{}{"window": "weekly", "remainingFraction": 0.9, "resetTime": weeklyReset},
-							},
-						},
-					},
-				})
-			case "/v1internal:retrieveUserQuota":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"buckets": []interface{}{
-						map[string]interface{}{"modelId": "gemini-2.5-flash", "remainingFraction": 0.4, "resetTime": fiveHourReset},
-					},
-				})
-			default:
-				http.NotFound(w, r)
-			}
-		}))
-		defer server.Close()
-
-		client := quota.NewClient(&config.Paths{DataDir: t.TempDir()})
-		client.SetBaseURL(server.URL)
-		info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "pro@example.com"}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !info.HasGemini || info.Gemini5hFraction != 0.4 || info.HasGeminiWeekly {
-			t.Fatalf("unexpected Pro Gemini quota classification: %+v", info)
-		}
-	})
-}
-
-func TestClient_Fetch_DailyCloudCodeAndCacheAndBoolDisabled(t *testing.T) {
-	now := time.Now().UTC()
-	weeklyReset := now.Add(5 * 24 * time.Hour).Format(time.RFC3339)
-	fiveHourReset := now.Add(4 * time.Hour).Format(time.RFC3339)
-
-	t.Run("daily CloudCode shape without gemini-2.5-pro and skipping loadCodeAssist on non-forced expired refresh", func(t *testing.T) {
-		var loadCalls, summaryCalls, modelsCalls atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				loadCalls.Add(1)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"cloudaicompanionProject": "aicode-consumers",
-					"paidTier":                map[string]interface{}{"id": "g1-ultra-tier"},
-				})
-			case "/v1internal:retrieveUserQuotaSummary":
-				summaryCalls.Add(1)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{
-						map[string]interface{}{
-							"displayName": "Claude and GPT models",
-							"buckets": []interface{}{
-								map[string]interface{}{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0},
-								map[string]interface{}{"bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0},
-							},
-						},
-					},
-				})
-			case "/v1internal:retrieveUserQuota":
-				modelsCalls.Add(1)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"buckets": []interface{}{
-						map[string]interface{}{"modelId": "claude-sonnet-5-5-medium", "remainingFraction": 1.0, "resetTime": fiveHourReset},
-						map[string]interface{}{"modelId": "gemini-2.5-flash", "remainingFraction": 0.06663115, "resetTime": weeklyReset},
-						map[string]interface{}{"modelId": "gemini-4-hydrogen-sonar", "remainingFraction": 0.06663115, "resetTime": weeklyReset},
-					},
-				})
-			default:
-				http.NotFound(w, r)
-			}
-		}))
-		defer server.Close()
-
-		tmpDir := t.TempDir()
-		expiredCache, err := json.Marshal(map[string]quota.QuotaInfo{
-			"daily@example.com": {
-				Tier:      "Pro",
-				Project:   "aicode-consumers",
-				Email:     "daily@example.com",
-				UpdatedAt: now.Add(-time.Hour),
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(tmpDir, "quota_cache.json"), expiredCache, 0600); err != nil {
-			t.Fatal(err)
-		}
-
-		client := quota.NewClient(&config.Paths{DataDir: tmpDir})
-		client.SetBaseURL(server.URL)
-		tok := &profile.Token{AccessToken: "tok", Email: "daily@example.com"}
-
-		// Non-forced expired cache fetch should skip loadCodeAssist (2 HTTP calls total).
-		info, err := client.Fetch(tok, false)
-		if err != nil {
-			t.Fatalf("non-forced Fetch failed: %v", err)
-		}
-		if loadCalls.Load() != 0 || summaryCalls.Load() != 1 || modelsCalls.Load() != 1 {
-			t.Fatalf("unexpected call counts for non-forced expired fetch: load=%d summary=%d models=%d", loadCalls.Load(), summaryCalls.Load(), modelsCalls.Load())
-		}
-		if info.Tier != "Pro" || info.Project != "aicode-consumers" {
-			t.Fatalf("expected cached Tier=Pro and Project=aicode-consumers, got %+v", info)
-		}
-		if info.HasGemini {
-			t.Fatalf("expected HasGemini=false when only weekly Gemini resetTime present, got %+v", info)
-		}
-		if !info.HasGeminiWeekly || math.Abs(info.GeminiWeeklyFraction-0.06663115) > 1e-6 || info.GeminiWeeklyReset != weeklyReset {
-			t.Fatalf("expected GeminiWeeklyFraction ~0.06663115, got %+v", info)
-		}
-		if !info.HasClaude || info.Claude5hFraction != 1.0 || !info.HasClaudeWeekly || info.ClaudeWeeklyFraction != 1.0 {
-			t.Fatalf("unexpected Claude quota: %+v", info)
-		}
-
-		// Forced refresh should call loadCodeAssist (3 HTTP calls total) and update Tier.
-		loadCalls.Store(0)
-		summaryCalls.Store(0)
-		modelsCalls.Store(0)
-		infoForced, err := client.Fetch(tok, true)
-		if err != nil {
-			t.Fatalf("forced Fetch failed: %v", err)
-		}
-		if loadCalls.Load() != 1 || summaryCalls.Load() != 1 || modelsCalls.Load() != 1 {
-			t.Fatalf("unexpected call counts for forced fetch: load=%d summary=%d models=%d", loadCalls.Load(), summaryCalls.Load(), modelsCalls.Load())
-		}
-		if infoForced.Tier != "Ultra" {
-			t.Fatalf("expected updated Tier=Ultra on forced fetch, got %q", infoForced.Tier)
-		}
-	})
-
-	t.Run("boolean disabled in summary sets 5h disabled flags", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "g1-pro-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{
-						map[string]interface{}{
-							"displayName": "Gemini Models",
-							"buckets": []interface{}{
-								map[string]interface{}{"window": "5h", "remainingFraction": 1.0, "disabled": true},
-								map[string]interface{}{"window": "weekly", "remainingFraction": 0.0, "resetTime": weeklyReset},
-							},
-						},
-						map[string]interface{}{
-							"displayName": "Claude and GPT models",
-							"buckets": []interface{}{
-								map[string]interface{}{"window": "5h", "remainingFraction": 0.8, "disabled": true},
-								map[string]interface{}{"window": "weekly", "remainingFraction": 0.0, "resetTime": weeklyReset},
-							},
-						},
-					},
-				})
-			default:
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-			}
-		}))
-		defer server.Close()
-
-		client := quota.NewClient(&config.Paths{DataDir: t.TempDir()})
-		client.SetBaseURL(server.URL)
-		info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "disabled@example.com"}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !info.Gemini5hDisabled || !info.Claude5hDisabled {
-			t.Fatalf("expected Gemini5hDisabled and Claude5hDisabled true, got %+v", info)
-		}
-	})
-
-	t.Run("sends updated User-Agent and matches bucketId-based Gemini/Claude groups", func(t *testing.T) {
-		var mu sync.Mutex
-		var seenUAs []string
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			seenUAs = append(seenUAs, r.Header.Get("User-Agent"))
-			mu.Unlock()
-			switch r.URL.Path {
-			case "/v1internal:loadCodeAssist":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"paidTier": map[string]interface{}{"id": "g1-pro-tier"}})
-			case "/v1internal:retrieveUserQuotaSummary":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"groups": []interface{}{
-						map[string]interface{}{
-							"displayName": "Google Models",
-							"buckets": []interface{}{
-								map[string]interface{}{"bucketId": "gemini-5h", "remainingFraction": 1.0, "resetTime": fiveHourReset},
-								map[string]interface{}{"bucketId": "gemini-weekly", "remainingFraction": 0.41, "resetTime": weeklyReset},
-							},
-						},
-						map[string]interface{}{
-							"displayName": "Third Party Models",
-							"buckets": []interface{}{
-								map[string]interface{}{"bucketId": "3p-5h", "remainingFraction": 1.0, "resetTime": fiveHourReset},
-								map[string]interface{}{"bucketId": "3p-weekly", "remainingFraction": 1.0, "resetTime": weeklyReset},
-							},
-						},
-					},
-				})
-			default:
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{})
-			}
-		}))
-		defer server.Close()
-
-		client := quota.NewClient(&config.Paths{DataDir: t.TempDir()})
-		client.SetBaseURL(server.URL)
-		info, err := client.Fetch(&profile.Token{AccessToken: "tok", Email: "bucketid@example.com"}, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(seenUAs) == 0 {
-			t.Fatal("expected User-Agent header on outgoing requests")
-		}
-		for _, ua := range seenUAs {
-			if !strings.HasPrefix(ua, "antigravity/1.5.") {
-				t.Fatalf("expected User-Agent starting with antigravity/1.5., got %q", ua)
-			}
-		}
-		if !info.HasGemini || info.Gemini5hFraction != 1.0 {
-			t.Fatalf("expected Gemini 5h=1.0, got %+v", info)
-		}
-		if !info.HasGeminiWeekly || math.Abs(info.GeminiWeeklyFraction-0.41) > 1e-6 {
-			t.Fatalf("expected Gemini weekly=0.41, got %+v", info)
-		}
-		if !info.HasClaude || info.Claude5hFraction != 1.0 || !info.HasClaudeWeekly || info.ClaudeWeeklyFraction != 1.0 {
-			t.Fatalf("expected Claude 5h=1.0 and weekly=1.0, got %+v", info)
-		}
-	})
 }

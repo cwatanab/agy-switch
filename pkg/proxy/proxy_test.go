@@ -82,46 +82,6 @@ func TestRaceProtocol_TimeoutUnreachable(t *testing.T) {
 	}
 }
 
-func TestProbeGeo_MockServer(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"country": "US",
-		})
-	}))
-	defer server.Close()
-
-	cc, blocked, err := proxy.ProbeGeoWithURL("", server.URL)
-	if err != nil {
-		t.Fatalf("probe failed: %v", err)
-	}
-	if cc != "US" {
-		t.Errorf("expected US, got %s", cc)
-	}
-	if blocked {
-		t.Errorf("expected not blocked for US")
-	}
-}
-
-func TestProbeGeo_BlockedCountry(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"country": "CN",
-		})
-	}))
-	defer server.Close()
-
-	cc, blocked, err := proxy.ProbeGeoWithURL("", server.URL)
-	if err != nil {
-		t.Fatalf("probe failed: %v", err)
-	}
-	if cc != "CN" {
-		t.Errorf("expected CN, got %s", cc)
-	}
-	if !blocked {
-		t.Errorf("expected blocked for CN")
-	}
-}
-
 func TestStore_RenameUpdateAndProbe(t *testing.T) {
 	paths := &config.Paths{DataDir: t.TempDir()}
 	store := proxy.NewStore(paths)
@@ -258,43 +218,36 @@ func TestCheckNetwork_CachingAndStates(t *testing.T) {
 	}))
 	defer targetSrv.Close()
 
-	geoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{"country": "CN"})
-	}))
-	defer geoSrv.Close()
-
 	now := time.Now()
-	state, cc := proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
+	state, _ := proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
 		TargetURL:  targetSrv.URL,
-		GeoURL:     geoSrv.URL,
 		HTTPClient: targetSrv.Client(),
 		Now:        now,
 	})
-	if state != proxy.NetStateRegion || cc != "CN" || hits != 1 {
-		t.Fatalf("unexpected CheckNetwork result: state=%s cc=%s hits=%d", state, cc, hits)
+	if state != proxy.NetStateOK || hits != 1 {
+		t.Fatalf("unexpected CheckNetwork result: state=%s hits=%d", state, hits)
 	}
 
-	// Second call within 10m uses cache
-	state2, cc2 := proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
+	// Second call within TTL uses cache
+	state2, _ := proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
 		TargetURL:  targetSrv.URL,
-		GeoURL:     geoSrv.URL,
 		HTTPClient: targetSrv.Client(),
 		Now:        now.Add(2 * time.Minute),
 	})
-	if state2 != proxy.NetStateRegion || cc2 != "CN" || hits != 1 {
-		t.Fatalf("expected cached region result, got state=%s cc=%s hits=%d", state2, cc2, hits)
+	if state2 != proxy.NetStateOK || hits != 1 {
+		t.Fatalf("expected cached ok result, got state=%s hits=%d", state2, hits)
 	}
 
 	// Changing active proxy changes NetTag and invalidates cache
 	_ = store.Save(proxy.Config{Name: "us", Host: "10.0.0.1", Port: 8080, Protocol: "http", Active: true})
-	_, _ = proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
+	targetSrv.Close()
+	state3, _ := proxy.CheckNetwork(context.Background(), paths, store, proxy.NetCheckOptions{
 		TargetURL:  targetSrv.URL,
-		GeoURL:     geoSrv.URL,
 		HTTPClient: targetSrv.Client(),
 		Now:        now.Add(2 * time.Minute),
 	})
-	if hits != 2 {
-		t.Fatalf("expected cache miss on proxy change, hits=%d", hits)
+	if state3 != proxy.NetStateBlocked {
+		t.Fatalf("expected NetStateBlocked after proxy change to closed target, got %s", state3)
 	}
 }
 

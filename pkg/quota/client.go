@@ -1,37 +1,46 @@
 package quota
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ZhangNy301/agy-switch/pkg/config"
+	"github.com/ZhangNy301/agy-switch/pkg/filelock"
+	"github.com/ZhangNy301/agy-switch/pkg/keyring"
 	"github.com/ZhangNy301/agy-switch/pkg/profile"
 )
 
 const (
-	DefaultBaseURL     = "https://daily-cloudcode-pa.googleapis.com"
 	CacheTTL           = 15 * time.Minute
 	DefaultTimeout     = 15 * time.Second
 	DefaultConcurrency = 4
+	DefaultRevokeURL   = "https://oauth2.googleapis.com/revoke"
 )
 
-// Options configures a quota client's dependencies and request limits.
-// Limits apply to the entire fetch, including OAuth refresh and retry waits.
+// Options configures a quota client's dependencies and execution limits.
 type Options struct {
 	HTTPClient        *http.Client
 	Timeout           time.Duration
 	MaxConcurrentHTTP int
-	OAuthURL          string
 	RevokeURL         string
-	AICodeURL         string
-	OAuthPair         *OAuthPair
+	TokenStore        keyring.TokenStore
+	UseKeyringSwap    *bool
 	FindAgy           func(*config.Paths) (string, error)
+	ProxyEnv          func() ([]string, error)
+	RunUsage          func(ctx context.Context, tok *profile.Token) ([]byte, *profile.Token, error)
 	OnTokenRefreshed  func(tok *profile.Token)
 }
 
@@ -45,12 +54,13 @@ type flight struct {
 
 type Client struct {
 	paths            *config.Paths
-	baseURL          string
-	oauthURL         string
 	revokeURL        string
-	aicodeURL        string
-	oauthPair        *OAuthPair
+	tokenStore       keyring.TokenStore
+	useKeyringSwap   bool
+	keyringSlot      chan struct{}
 	findAgy          func(*config.Paths) (string, error)
+	proxyEnv         func() ([]string, error)
+	runUsage         func(ctx context.Context, tok *profile.Token) ([]byte, *profile.Token, error)
 	onTokenRefreshed func(tok *profile.Token)
 	httpClient       *http.Client
 	timeout          time.Duration
@@ -62,11 +72,6 @@ type Client struct {
 	started          bool
 	flights          map[[32]byte]*flight
 	tokens           map[[32]byte]profile.Token
-	oauthMu          sync.Mutex
-	discoveredPair   *OAuthPair
-	scannedPath      string
-	scannedIDs       []string
-	scannedSecrets   []string
 }
 
 func NewClient(paths *config.Paths) *Client { return NewClientWithOptions(paths, Options{}) }
@@ -82,34 +87,30 @@ func NewClientWithOptions(paths *config.Paths, opts Options) *Client {
 	if opts.MaxConcurrentHTTP <= 0 {
 		opts.MaxConcurrentHTTP = DefaultConcurrency
 	}
-	if opts.OAuthURL == "" {
-		opts.OAuthURL = "https://oauth2.googleapis.com/token"
-	}
 	if opts.RevokeURL == "" {
-		opts.RevokeURL = "https://oauth2.googleapis.com/revoke"
+		opts.RevokeURL = DefaultRevokeURL
 	}
-	if opts.AICodeURL == "" {
-		opts.AICodeURL = DefaultAICodeURL
+	useSwap := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	if opts.UseKeyringSwap != nil {
+		useSwap = *opts.UseKeyringSwap
 	}
-	if opts.OAuthPair != nil {
-		pair := *opts.OAuthPair
-		opts.OAuthPair = &pair
+	return &Client{
+		paths:            paths,
+		revokeURL:        opts.RevokeURL,
+		tokenStore:       opts.TokenStore,
+		useKeyringSwap:   useSwap && opts.TokenStore != nil,
+		keyringSlot:      make(chan struct{}, 1),
+		findAgy:          opts.FindAgy,
+		proxyEnv:         opts.ProxyEnv,
+		runUsage:         opts.RunUsage,
+		onTokenRefreshed: opts.OnTokenRefreshed,
+		httpClient:       opts.HTTPClient,
+		timeout:          opts.Timeout,
+		slots:            make(chan struct{}, opts.MaxConcurrentHTTP),
+		flights:          make(map[[32]byte]*flight),
+		tokens:           make(map[[32]byte]profile.Token),
 	}
-	return &Client{paths: paths, baseURL: DefaultBaseURL, oauthURL: opts.OAuthURL, revokeURL: opts.RevokeURL, aicodeURL: opts.AICodeURL,
-		oauthPair: opts.OAuthPair, findAgy: opts.FindAgy, onTokenRefreshed: opts.OnTokenRefreshed,
-		httpClient: opts.HTTPClient, timeout: opts.Timeout, slots: make(chan struct{}, opts.MaxConcurrentHTTP),
-		flights: make(map[[32]byte]*flight), tokens: make(map[[32]byte]profile.Token)}
 }
-
-// SetBaseURL replaces the CloudCode API endpoint before the client is first used
-// and disables the default AICode gRPC endpoint for isolated mock-server tests.
-func (c *Client) SetBaseURL(url string) {
-	c.baseURL = url
-	c.aicodeURL = ""
-}
-
-// SetAICodeURL sets the AICode gRPC base URL (empty string disables AICode).
-func (c *Client) SetAICodeURL(url string) { c.aicodeURL = url }
 
 // SetLimits configures limits before the first fetch starts.
 func (c *Client) SetLimits(timeout time.Duration, concurrency int) error {
@@ -150,21 +151,25 @@ func (c *Client) FetchContext(ctx context.Context, tok *profile.Token, force boo
 	key := sha256.Sum256([]byte(tok.Email + "\x00" + keyToken))
 	c.flightMu.Lock()
 	timeout := c.timeout
+	waitTimeout := timeout
+	if c.useKeyringSwap && c.runUsage == nil && waitTimeout < 90*time.Second {
+		waitTimeout = 90 * time.Second
+	}
 	f := c.flights[key]
 	if f == nil {
 		c.started = true
-		opCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		opCtx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 		f = &flight{done: make(chan struct{}), cancel: cancel}
 		c.flights[key] = f
 		token := *tok
 		if fresh, ok := c.tokens[key]; ok && time.Until(fresh.ExpiresAt) > 2*time.Minute {
 			token = fresh
 		}
-		go c.runFetch(opCtx, key, f, token, force)
+		go c.runFetch(opCtx, key, f, token)
 	}
 	f.waiters++
 	c.flightMu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 	defer func() {
 		c.flightMu.Lock()
@@ -192,9 +197,9 @@ func (c *Client) FetchContext(ctx context.Context, tok *profile.Token, force boo
 	}
 }
 
-func (c *Client) runFetch(ctx context.Context, key [32]byte, f *flight, tok profile.Token, force bool) {
+func (c *Client) runFetch(ctx context.Context, key [32]byte, f *flight, tok profile.Token) {
 	defer f.cancel()
-	info, err := c.fetchNetwork(ctx, &tok, force)
+	info, err := c.fetchViaCLI(ctx, &tok)
 	c.flightMu.Lock()
 	if tok.AccessToken != "" && time.Until(tok.ExpiresAt) > 2*time.Minute {
 		c.tokens[key] = tok
@@ -207,270 +212,58 @@ func (c *Client) runFetch(ctx context.Context, key [32]byte, f *flight, tok prof
 	c.flightMu.Unlock()
 }
 
-type endpointResult struct {
-	data map[string]interface{}
-	err  error
-}
-
-func (c *Client) fetchEndpoints(ctx context.Context, accessToken, project string, includeLoad bool) []endpointResult {
-	loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
-	quotaBody := map[string]interface{}{}
-	if project != "" {
-		quotaBody["project"] = project
-	}
-	calls := []struct {
-		path string
-		body interface{}
-	}{
-		{"/v1internal:loadCodeAssist", loadBody},
-		{"/v1internal:retrieveUserQuotaSummary", quotaBody},
-		{"/v1internal:retrieveUserQuota", quotaBody},
-	}
-	results := make([]endpointResult, len(calls))
-	var wg sync.WaitGroup
-	for i, call := range calls {
-		if i == 0 && !includeLoad {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i].data, results[i].err = c.postJSON(ctx, accessToken, call.path, call.body)
-		}()
-	}
-	wg.Wait()
-	return results
-}
-
-func hasUnauthorizedError(results []endpointResult) bool {
-	var statusErr httpStatusError
-	for _, r := range results {
-		if errors.As(r.err, &statusErr) && statusErr.status == http.StatusUnauthorized {
-			return true
-		}
-	}
-	return false
-}
-
-func isForbiddenError(err error) bool {
-	var statusErr httpStatusError
-	return errors.As(err, &statusErr) && statusErr.status == http.StatusForbidden
-}
-
-func (c *Client) retryQuotaWithProject(ctx context.Context, accessToken, project string, results []endpointResult) {
-	paths := []string{"", "/v1internal:retrieveUserQuotaSummary", "/v1internal:retrieveUserQuota"}
-	body := map[string]interface{}{"project": project}
-	var wg sync.WaitGroup
-	for i := 1; i <= 2; i++ {
-		if !isForbiddenError(results[i].err) {
-			continue
-		}
-		idx, path := i, paths[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[idx].data, results[idx].err = c.postJSON(ctx, accessToken, path, body)
-		}()
-	}
-	wg.Wait()
-}
-
-func (c *Client) fetchNetwork(ctx context.Context, tok *profile.Token, force bool) (*QuotaInfo, error) {
-	refreshed := false
-	if tok.AccessToken == "" || (!tok.ExpiresAt.IsZero() && time.Until(tok.ExpiresAt) < 2*time.Minute) {
-		if err := c.refreshAccessToken(ctx, tok); err != nil {
-			return c.cachedFailure(tok.Email, err)
-		}
-		refreshed = true
-	}
-	cachedTier := ""
-	cachedProject := ""
-	if tok.Email != "" {
-		if cached, ok := c.Cached(tok.Email); ok {
-			cachedTier = cached.Tier
-			cachedProject = cached.Project
-		}
-	}
-
-	var loadRes endpointResult
-	var aicodeSummary *aiCodeQuotaSummary
-	var aicodeErr error
-	var results []endpointResult
-	needTier := force || cachedTier == "" || cachedTier == "?"
-
-	needLoad := force || cachedTier == "" || cachedTier == "?" || cachedProject == ""
-	if c.aicodeURL != "" {
-		loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
-		runPrimary := func() {
-			var wg sync.WaitGroup
-			if needTier {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					loadRes.data, loadRes.err = c.postJSON(ctx, tok.AccessToken, "/v1internal:loadCodeAssist", loadBody)
-				}()
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				aicodeSummary, aicodeErr = c.fetchAICodeQuota(ctx, tok.AccessToken)
-			}()
-			wg.Wait()
-		}
-		runPrimary()
-		if !refreshed && tok.RefreshToken != "" && (hasUnauthorizedError([]endpointResult{loadRes}) || isUnauthorizedError(aicodeErr)) {
-			if err := c.refreshAccessToken(ctx, tok); err != nil {
-				return c.cachedFailure(tok.Email, err)
-			}
-			refreshed = true
-			runPrimary()
-		}
-	} else {
-		results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject, needLoad)
-		if !refreshed && tok.RefreshToken != "" && hasUnauthorizedError(results) {
-			if err := c.refreshAccessToken(ctx, tok); err != nil {
-				return c.cachedFailure(tok.Email, err)
-			}
-			refreshed = true
-			results = c.fetchEndpoints(ctx, tok.AccessToken, cachedProject, needLoad)
-		}
-		loadRes = results[0]
-	}
-
-	project := cachedProject
-	if loadRes.data != nil {
-		if p, ok := loadRes.data["cloudaicompanionProject"].(string); ok && p != "" {
-			project = p
-		}
-	}
-
+func (c *Client) fetchViaCLI(ctx context.Context, tok *profile.Token) (*QuotaInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return c.cachedFailure(tok.Email, err)
 	}
 
+	var raw []byte
+	var refreshedTok *profile.Token
+	var err error
+	if c.runUsage != nil {
+		raw, refreshedTok, err = c.runUsage(ctx, tok)
+	} else {
+		raw, refreshedTok, err = c.runAgyUsage(ctx, tok)
+	}
+	if err != nil {
+		return c.cachedFailure(tok.Email, err)
+	}
+
+	parsed, err := parseCLIUsage(raw)
+	if err != nil {
+		return c.cachedFailure(tok.Email, err)
+	}
+
 	tier := "?"
-	if !needTier {
-		tier = cachedTier
+	if tok.Email != "" {
+		if cached, ok := c.Cached(tok.Email); ok && cached.Tier != "" && cached.Tier != "?" {
+			tier = cached.Tier
+		}
 	}
-	info := &QuotaInfo{Tier: tier, Project: project, Email: tok.Email, UpdatedAt: time.Now()}
-	applyTier(info, loadRes.data)
-	if aicodeErr == nil && aicodeSummary != nil {
-		applyAICodeSummary(info, aicodeSummary)
+	info := &QuotaInfo{
+		Tier:      tier,
+		Email:     tok.Email,
+		UpdatedAt: time.Now(),
 	}
+	applyCLIUsage(info, parsed)
 
-	hasAnyQuota := info.HasGemini || info.HasClaude || info.HasGeminiWeekly || info.HasClaudeWeekly
-	if c.aicodeURL != "" && !hasAnyQuota {
-		// Fallback to CloudCode quota endpoints if AICode failed or returned no groups.
-		quotaProject := project
-		quotaBody := map[string]interface{}{}
-		if quotaProject != "" {
-			quotaBody["project"] = quotaProject
+	if refreshedTok != nil {
+		*tok = *refreshedTok
+		if tok.Email != "" {
+			info.Email = tok.Email
 		}
-		results = make([]endpointResult, 3)
-		results[0] = loadRes
-		var wg sync.WaitGroup
-		if !needTier && loadRes.data == nil && loadRes.err == nil {
-			loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				results[0].data, results[0].err = c.postJSON(ctx, tok.AccessToken, "/v1internal:loadCodeAssist", loadBody)
-			}()
-		}
-		for i, path := range []string{"", "/v1internal:retrieveUserQuotaSummary", "/v1internal:retrieveUserQuota"} {
-			if i == 0 {
-				continue
-			}
-			idx, p := i, path
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				results[idx].data, results[idx].err = c.postJSON(ctx, tok.AccessToken, p, quotaBody)
-			}()
-		}
-		wg.Wait()
-		if !refreshed && tok.RefreshToken != "" && hasUnauthorizedError(results) {
-			if err := c.refreshAccessToken(ctx, tok); err == nil {
-				refreshed = true
-				for i, path := range []string{"", "/v1internal:retrieveUserQuotaSummary", "/v1internal:retrieveUserQuota"} {
-					if i == 0 {
-						continue
-					}
-					results[i].data, results[i].err = c.postJSON(ctx, tok.AccessToken, path, quotaBody)
-				}
-			}
-		}
-		if results[0].data != nil {
-			applyTier(info, results[0].data)
-			if p, ok := results[0].data["cloudaicompanionProject"].(string); ok && p != "" {
-				project = p
-				info.Project = p
-			}
-		}
-		if project != "" && project != cachedProject &&
-			(isForbiddenError(results[1].err) || isForbiddenError(results[2].err)) {
-			c.retryQuotaWithProject(ctx, tok.AccessToken, project, results)
-		}
-		applySummary(info, results[1].data)
-		applyModelsAt(info, results[2].data, time.Now())
-		hasAnyQuota = info.HasGemini || info.HasClaude || info.HasGeminiWeekly || info.HasClaudeWeekly
-	} else if c.aicodeURL == "" {
-		if !needLoad && (isForbiddenError(results[1].err) || isForbiddenError(results[2].err)) {
-			loadBody := map[string]interface{}{"metadata": map[string]interface{}{"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}
-			results[0].data, results[0].err = c.postJSON(ctx, tok.AccessToken, "/v1internal:loadCodeAssist", loadBody)
-			loadRes = results[0]
-			if results[0].data != nil {
-				applyTier(info, results[0].data)
-				if p, ok := results[0].data["cloudaicompanionProject"].(string); ok && p != "" {
-					project = p
-					info.Project = p
-				}
-			}
-		}
-		if project != "" && project != cachedProject &&
-			(isForbiddenError(results[1].err) || isForbiddenError(results[2].err)) {
-			c.retryQuotaWithProject(ctx, tok.AccessToken, project, results)
-		}
-		applySummary(info, results[1].data)
-		applyModelsAt(info, results[2].data, time.Now())
-		hasAnyQuota = info.HasGemini || info.HasClaude || info.HasGeminiWeekly || info.HasClaudeWeekly
-	}
-
-	if refreshed {
 		tokCopy := *tok
 		info.RefreshedToken = &tokCopy
-		info.Email = tok.Email
 		if c.onTokenRefreshed != nil {
 			c.onTokenRefreshed(&tokCopy)
 		}
 	}
 
-	if info.Tier == "?" && !hasAnyQuota {
-		var errs []error
-		errs = append(errs, errors.New("all quota calls failed"), loadRes.err)
-		if aicodeErr != nil {
-			errs = append(errs, aicodeErr)
-		}
-		if len(results) >= 3 {
-			errs = append(errs, results[1].err, results[2].err)
-		}
-		return c.cachedFailure(tok.Email, errors.Join(errs...))
-	}
+	hasAnyQuota := info.HasGemini || info.HasClaude || info.HasGeminiWeekly || info.HasClaudeWeekly
 	if !hasAnyQuota {
-		var qErrs []error
-		if aicodeErr != nil {
-			qErrs = append(qErrs, aicodeErr)
-		}
-		if len(results) >= 3 && (results[1].err != nil || results[2].err != nil) {
-			qErrs = append(qErrs, results[1].err, results[2].err)
-		}
-		if len(qErrs) > 0 {
-			return c.cachedFailure(tok.Email, errors.Join(append([]error{errors.New("quota endpoints failed")}, qErrs...)...))
-		}
-		if existing, ok := c.Cached(tok.Email); ok && (existing.HasGemini || existing.HasClaude || existing.HasGeminiWeekly || existing.HasClaudeWeekly) {
-			return existing, errors.New("quota response contained no model usage data")
-		}
+		return c.cachedFailure(tok.Email, errors.New("agy /usage returned no quota data"))
 	}
+
 	if tok.Email != "" {
 		if err := c.saveCached(ctx, tok.Email, info); err != nil {
 			return info, err
@@ -479,9 +272,237 @@ func (c *Client) fetchNetwork(ctx context.Context, tok *profile.Token, force boo
 	return info, nil
 }
 
-func isUnauthorizedError(err error) bool {
-	var statusErr httpStatusError
-	return errors.As(err, &statusErr) && statusErr.status == http.StatusUnauthorized
+func (c *Client) runAgyUsage(ctx context.Context, tok *profile.Token) ([]byte, *profile.Token, error) {
+	if c.findAgy == nil {
+		return nil, nil, fmt.Errorf("agy binary finder not configured")
+	}
+	agyBin, err := c.findAgy(c.paths)
+	if err != nil {
+		return nil, nil, fmt.Errorf("locate agy binary: %w", err)
+	}
+
+	tokBytes, err := marshalTokenForCLI(tok)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal token: %w", err)
+	}
+
+	usingKeyringSwap := c.useKeyringSwap && c.tokenStore != nil
+	if usingKeyringSwap {
+		select {
+		case c.keyringSlot <- struct{}{}:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+		defer func() { <-c.keyringSlot }()
+
+		if c.paths != nil && c.paths.DataDir != "" {
+			releaseLock, lErr := filelock.Acquire(ctx, filepath.Join(c.paths.DataDir, "accounts.lock"))
+			if lErr != nil {
+				return nil, nil, lErr
+			}
+			defer func() { _ = releaseLock() }()
+		}
+
+		origLive, origErr := c.tokenStore.ReadLive()
+		if origErr != nil && !os.IsNotExist(origErr) {
+			return nil, nil, fmt.Errorf("read live credential before quota check: %w", origErr)
+		}
+		origExists := origErr == nil && len(origLive) > 0
+		if !origExists || !sameTokenGrant(origLive, tok) {
+			if wErr := c.tokenStore.WriteLive(tokBytes); wErr != nil {
+				return nil, nil, fmt.Errorf("stage account credential for quota check: %w", wErr)
+			}
+			defer func() {
+				if origExists {
+					_ = c.tokenStore.WriteLive(origLive)
+				} else {
+					_ = c.tokenStore.DeleteLive()
+				}
+			}()
+		}
+	} else {
+		select {
+		case c.slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+		defer func() { <-c.slots }()
+	}
+
+	tmpHome, err := os.MkdirTemp("", "agy-switch-usage-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create isolated home: %w", err)
+	}
+	defer os.RemoveAll(tmpHome)
+
+	tokDir := filepath.Join(tmpHome, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(tokDir, 0700); err != nil {
+		return nil, nil, fmt.Errorf("create isolated config dir: %w", err)
+	}
+	tokPath := filepath.Join(tokDir, "antigravity-oauth-token")
+	if err := os.WriteFile(tokPath, tokBytes, 0600); err != nil {
+		return nil, nil, fmt.Errorf("write isolated token: %w", err)
+	}
+
+	overrides := []string{
+		"HOME=" + tmpHome,
+		"USERPROFILE=" + tmpHome,
+		"XDG_CONFIG_HOME=" + filepath.Join(tmpHome, ".config"),
+		"XDG_DATA_HOME=" + filepath.Join(tmpHome, ".local", "share"),
+		"AGY_SWITCH_NO_REASSERT=1",
+	}
+	if !usingKeyringSwap {
+		overrides = append(overrides, "DBUS_SESSION_BUS_ADDRESS=", "GNOME_KEYRING_CONTROL=")
+	}
+	if c.proxyEnv != nil {
+		if pEnv, pErr := c.proxyEnv(); pErr == nil && len(pEnv) > 0 {
+			overrides = append(overrides, pEnv...)
+		}
+	}
+
+	cmdCtx, cmdCancel := context.WithTimeout(ctx, c.timeout)
+	defer cmdCancel()
+
+	stdout, stderr, err := execUsageCommand(cmdCtx, agyBin, []string{"--output-format", "json", "-p", "/usage"}, mergeEnv(os.Environ(), overrides))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, ctxErr
+		}
+		if cmdErr := cmdCtx.Err(); cmdErr != nil {
+			return nil, nil, cmdErr
+		}
+		errMsg := strings.Join(strings.Fields(string(stderr)), " ")
+		if len(errMsg) > 240 {
+			errMsg = errMsg[:237] + "..."
+		}
+		if errMsg != "" {
+			return nil, nil, fmt.Errorf("agy /usage failed: %w (%s)", err, errMsg)
+		}
+		return nil, nil, fmt.Errorf("agy /usage failed: %w", err)
+	}
+
+	var refreshedTok *profile.Token
+	if usingKeyringSwap {
+		if afterLive, rErr := c.tokenStore.ReadLive(); rErr == nil && !bytes.Equal(afterLive, tokBytes) {
+			if parsedTok, pErr := profile.ParseTokenJSON(afterLive); pErr == nil && (parsedTok.AccessToken != "" || parsedTok.RefreshToken != "") {
+				if parsedTok.Email == "" {
+					parsedTok.Email = tok.Email
+				}
+				refreshedTok = parsedTok
+			}
+		}
+	}
+	if refreshedTok == nil {
+		if afterBytes, rErr := os.ReadFile(tokPath); rErr == nil && !bytes.Equal(afterBytes, tokBytes) {
+			if parsedTok, pErr := profile.ParseTokenJSON(afterBytes); pErr == nil && (parsedTok.AccessToken != "" || parsedTok.RefreshToken != "") {
+				if parsedTok.Email == "" {
+					parsedTok.Email = tok.Email
+				}
+				refreshedTok = parsedTok
+			}
+		}
+	}
+
+	return stdout, refreshedTok, nil
+}
+
+func sameTokenGrant(liveBytes []byte, tok *profile.Token) bool {
+	if tok == nil || len(liveBytes) == 0 {
+		return false
+	}
+	liveTok, err := profile.ParseTokenJSON(liveBytes)
+	if err != nil {
+		return false
+	}
+	if tok.RefreshToken != "" && liveTok.RefreshToken != "" {
+		return tok.RefreshToken == liveTok.RefreshToken
+	}
+	if tok.AccessToken != "" && liveTok.AccessToken != "" {
+		return tok.AccessToken == liveTok.AccessToken
+	}
+	return false
+}
+
+func marshalTokenForCLI(tok *profile.Token) ([]byte, error) {
+	if len(tok.Raw) > 0 {
+		return json.Marshal(tok.Raw)
+	}
+	inner := map[string]interface{}{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+	}
+	if !tok.ExpiresAt.IsZero() {
+		inner["expiry"] = tok.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	obj := map[string]interface{}{
+		"auth_method": "consumer",
+		"token":       inner,
+	}
+	if tok.IDToken != "" {
+		obj["id_token"] = tok.IDToken
+	}
+	if tok.Email != "" {
+		obj["id_token_email"] = tok.Email
+	}
+	return json.Marshal(obj)
+}
+
+func mergeEnv(base, overrides []string) []string {
+	idx := make(map[string]int, len(base)+len(overrides))
+	out := make([]string, 0, len(base)+len(overrides))
+	keyOf := func(kv string) string {
+		k, _, _ := strings.Cut(kv, "=")
+		if runtime.GOOS == "windows" {
+			return strings.ToUpper(k)
+		}
+		return k
+	}
+	for _, list := range [][]string{base, overrides} {
+		for _, kv := range list {
+			k := keyOf(kv)
+			if pos, ok := idx[k]; ok {
+				out[pos] = kv
+			} else {
+				idx[k] = len(out)
+				out = append(out, kv)
+			}
+		}
+	}
+	return out
+}
+
+// RevokeToken revokes the given refresh token at Google's public OAuth 2.0 revocation endpoint.
+func (c *Client) RevokeToken(ctx context.Context, refreshToken string) error {
+	if refreshToken == "" {
+		return fmt.Errorf("no refresh token to revoke")
+	}
+	select {
+	case c.slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-c.slots }()
+
+	form := url.Values{"token": {refreshToken}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.revokeURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("revoke OAuth token: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return fmt.Errorf("revoke OAuth token: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("revoke OAuth token: API returned HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *Client) cachedFailure(email string, err error) (*QuotaInfo, error) {

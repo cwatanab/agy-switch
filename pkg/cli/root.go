@@ -34,8 +34,8 @@ func NewCommand(paths *config.Paths, deps Dependencies) *cobra.Command {
 	}
 	var quotaTimeout = quota.DefaultTimeout
 	var quotaConcurrency = quota.DefaultConcurrency
-	rootCmd.PersistentFlags().DurationVar(&quotaTimeout, "quota-timeout", quota.DefaultTimeout, "Overall deadline for quota requests, refresh, and retries")
-	rootCmd.PersistentFlags().IntVar(&quotaConcurrency, "quota-concurrency", quota.DefaultConcurrency, "Maximum simultaneous quota HTTP requests (1-64)")
+	rootCmd.PersistentFlags().DurationVar(&quotaTimeout, "quota-timeout", quota.DefaultTimeout, "Overall deadline for quota checks")
+	rootCmd.PersistentFlags().IntVar(&quotaConcurrency, "quota-concurrency", quota.DefaultConcurrency, "Maximum simultaneous quota checks (1-64)")
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if err := a.quota.SetLimits(quotaTimeout, quotaConcurrency); err != nil {
 			return err
@@ -47,15 +47,9 @@ func NewCommand(paths *config.Paths, deps Dependencies) *cobra.Command {
 			_ = shim.Repair(paths, a.proxies)
 		}
 		if !isProxySubcommand(cmd) && !isPickerOrLoginCommand(cmd) && !a.deps.DisableNetCheck {
-			state, cc := a.checkNetwork(cmd.Context())
-			switch state {
-			case proxy.NetStateBlocked:
-				cmd.PrintErrln("agy-switch: cannot reach Google's API from this network — agy may fail\n  or report 'region not supported'. Fix: agy-switch proxy")
-			case proxy.NetStateRegion:
-				if cc == "" {
-					cc = "?"
-				}
-				cmd.PrintErrf("agy-switch: your current IP region (%s) is not supported by Google AI —\n  agy will report 'region not supported'. Fix: agy-switch proxy\n  (route through a supported region such as JP/SG/US)\n", cc)
+			state, _ := a.checkNetwork(cmd.Context())
+			if state == proxy.NetStateBlocked {
+				cmd.PrintErrln("agy-switch: cannot reach Google from this network — configure a proxy with: agy-switch proxy")
 			}
 		}
 		return nil

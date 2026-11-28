@@ -80,21 +80,12 @@ func (a *app) printProxyStatus(cmd *cobra.Command) error {
 	}
 
 	if !a.deps.DisableNetCheck {
-		netState, cc := a.checkNetwork(cmd.Context())
+		netState, _ := a.checkNetwork(cmd.Context())
 		switch netState {
 		case proxy.NetStateOK:
-			if cc != "" {
-				cmd.Printf("network: ok (exit region: %s)\n", cc)
-			} else {
-				cmd.Println("network: ok")
-			}
-		case proxy.NetStateBlocked:
-			cmd.Println("network: Google API unreachable")
+			cmd.Println("network: ok")
 		default:
-			if cc == "" {
-				cc = "?"
-			}
-			cmd.Printf("network: IP region %s not supported by Google AI\n", cc)
+			cmd.Println("network: Google unreachable")
 		}
 	}
 	return nil
@@ -121,9 +112,6 @@ func formatPlainProbe(chk *proxy.ProbeResult, now time.Time) string {
 		out += " · " + chk.ISP
 	}
 	out += " (" + age + ")"
-	if proxy.IsBlockedCountry(chk.CC) {
-		out += " [region unsupported]"
-	}
 	return out
 }
 

@@ -3,9 +3,8 @@ package tui_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,14 +21,13 @@ import (
 
 func TestPickerUsesCacheWithoutNetwork(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		fmt.Fprint(w, `{}`)
-	}))
-	defer server.Close()
 	dir := t.TempDir()
-	qc := quota.NewClient(&config.Paths{DataDir: dir})
-	qc.SetBaseURL(server.URL)
+	qc := quota.NewClientWithOptions(&config.Paths{DataDir: dir}, quota.Options{
+		RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+			requests.Add(1)
+			return []byte(`{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-5h","window":"5h","remaining_fraction":0.5}]}]}}}`), nil, nil
+		},
+	})
 	cache, err := json.Marshal(map[string]quota.QuotaInfo{
 		"old@test.local": {Tier: "Pro", HasGemini: true, Gemini5hFraction: .75, UpdatedAt: time.Now().Add(-time.Hour)},
 	})
@@ -55,14 +53,12 @@ func TestPickerUsesCacheWithoutNetwork(t *testing.T) {
 }
 
 func TestPickerShowsQuotaRefreshError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
 	dir := t.TempDir()
-	qc := quota.NewClient(&config.Paths{DataDir: dir})
-	qc.SetBaseURL(server.URL)
+	qc := quota.NewClientWithOptions(&config.Paths{DataDir: dir}, quota.Options{
+		RunUsage: func(context.Context, *profile.Token) ([]byte, *profile.Token, error) {
+			return nil, nil, errors.New("agy /usage failed")
+		},
+	})
 	cache, err := json.Marshal(map[string]quota.QuotaInfo{
 		"old@test.local": {Tier: "Pro", HasGemini: true, Gemini5hFraction: .75, UpdatedAt: time.Now().Add(-time.Hour)},
 	})
@@ -123,7 +119,7 @@ func TestPickerAsyncNetCheckWarning(t *testing.T) {
 		[]profile.Profile{{Name: "a1", Email: "a1@example.com"}},
 		nil,
 		tui.PickerOptions{
-			NetCheckFn: func(context.Context) (string, string) { return "region", "CN" },
+			NetCheckFn: func(context.Context) (string, string) { return "blocked", "" },
 		},
 	)
 	cmd := m.Init()
@@ -132,8 +128,8 @@ func TestPickerAsyncNetCheckWarning(t *testing.T) {
 	}
 	updated, _ := m.Update(cmd())
 	m = updated.(tui.PickerModel)
-	if view := m.View(); !strings.Contains(view, "IP region (CN) is not supported") {
-		t.Fatalf("expected async region warning in view, got:\n%s", view)
+	if view := m.View(); !strings.Contains(view, "cannot reach Google from this network") {
+		t.Fatalf("expected async netcheck warning in view, got:\n%s", view)
 	}
 }
 

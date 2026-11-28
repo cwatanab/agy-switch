@@ -845,9 +845,6 @@ func FormatProbeLine(chk *proxy.ProbeResult, probing bool, now time.Time) string
 	if chk.ISP != "" {
 		line += " · " + chk.ISP
 	}
-	if proxy.IsBlockedCountry(chk.CC) {
-		line += " " + BadgeUltra.Render("· region unsupported by Google AI")
-	}
 	return line
 }
 

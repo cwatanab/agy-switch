@@ -166,13 +166,7 @@ func (m PickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case netCheckMsg:
 		switch msg.state {
 		case "blocked":
-			m.netWarn = "cannot reach Google's API from this network — agy may fail (fix: agy-switch proxy)"
-		case "region":
-			cc := msg.cc
-			if cc == "" {
-				cc = "?"
-			}
-			m.netWarn = "IP region (" + cc + ") is not supported by Google AI (fix: agy-switch proxy)"
+			m.netWarn = "cannot reach Google from this network (configure proxy: agy-switch proxy)"
 		default:
 			m.netWarn = ""
 		}

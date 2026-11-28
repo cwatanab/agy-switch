@@ -35,13 +35,13 @@ agy-switch login        # add another account
 agy-switch              # select an account and launch agy
 ```
 
-Existing live credentials are saved before starting a new login, and an existing orphan login is adopted automatically on first run (with an OAuth token refresh to verify identity). Profile names default to the email prefix (with an interactive prompt on TTY when no name argument is given); a conflicting name gets a numeric suffix. Logging in again with the same OAuth grant updates its existing profile.
+Existing live credentials are saved before starting a new login, and an existing orphan login is adopted automatically on first run. Profile names default to the email prefix (with an interactive prompt on TTY when no name argument is given); a conflicting name gets a numeric suffix. Logging in again with the same OAuth grant updates its existing profile.
 
-In the account picker: `↑`/`↓` navigate (starting on the currently active account), `Enter` switches and launches `agy`, `r` refreshes quotas, and `q` quits. Each account shows its active indicator (`●`), subscription tier (`Free` / `Pro` / `Ultra`), last-active time, and Gemini / Claude 5-hour and weekly quotas with reset countdowns (`↻4d21h`) or `disabled` state. Cached quotas appear immediately while fresh values load in the background. Cached values remain visible if a refresh fails.
+In the account picker: `↑`/`↓` navigate (starting on the currently active account), `Enter` switches and launches `agy`, `r` refreshes quotas, and `q` quits. Each account shows its active indicator (`●`), last-active time, and Gemini / Claude 5-hour and weekly quotas with reset countdowns (`↻4d21h`) or `disabled` state. Cached quotas appear immediately while fresh values load in the background. Cached values remain visible if a refresh fails.
 
-Switching accounts (`agy-switch` or `agy-switch use`) warns if another `agy` process is still running, and `agy-switch ls` warns if a running `agy` overwrote the live token (which the next `agy` start automatically re-asserts). Startup also performs a cached pre-flight network check (`.netcheck`) and warns if Google APIs are unreachable or your exit IP region is unsupported by Google AI.
+Switching accounts (`agy-switch` or `agy-switch use`) warns if another `agy` process is still running, and `agy-switch ls` warns if a running `agy` overwrote the live token (which the next `agy` start automatically re-asserts). Startup also performs a cached pre-flight reachability check (`.netcheck`) and warns if Google is unreachable.
 
-Quota requests share a 15-second deadline and run at most four HTTP requests at a time. Adjust these with `--quota-timeout` and `--quota-concurrency`, for example `agy-switch --quota-timeout 30s --quota-concurrency 8`. Closing the picker cancels its pending requests.
+Quota checks invoke the official `agy --output-format json -p "/usage"` command in an isolated temporary home directory (never modifying your live login token) and cache results for 15 minutes (`ls` checks accounts concurrently). Requests share a 15-second deadline and run at most four checks at a time. Adjust these with `--quota-timeout` and `--quota-concurrency`, for example `agy-switch --quota-timeout 30s --quota-concurrency 8`. Closing the picker cancels its pending checks.
 
 ## Commands
 
@@ -57,11 +57,11 @@ Quota requests share a 15-second deadline and run at most four HTTP requests at 
 | `agy-switch proxy add <name> --server <host> --port <port>` | Register a proxy (auto-detects protocol unless `--protocol` is given) |
 | `agy-switch proxy edit <name>` | Edit fields of an existing proxy (`--server`, `--port`, `--protocol`, `--username`, `--password-env`, `--validity`, `--fallback`) |
 | `agy-switch proxy rename <old> <new>` | Rename a configured proxy |
-| `agy-switch proxy delete <name>` | Remove a configured proxy |
+| `agy-switch proxy delete <name>` (`rm`) | Remove a configured proxy |
 | `agy-switch proxy on [name]` / `off` | Enable a configured proxy / disable routing |
 | `agy-switch proxy status` | Show all configured proxies, exit geo/IP-type probes, shim/bridge status, and network check |
 | `agy-switch bridge status` / `stop` | Inspect or stop the local SOCKS bridge |
-| `agy-switch --version` | Print the version |
+| `agy-switch version` / `--version` | Print the version |
 
 ## Proxies
 
@@ -76,7 +76,7 @@ Use `--protocol http`, `https`, `socks5`, or `socks5h` to select a known protoco
 
 In the interactive proxy manager (`agy-switch proxy`):
 
-- `↑`/`↓` navigate · `Enter` enable & quit · `space` toggle on/off · `a` add wizard (prefills from `HTTPS_PROXY` when present and auto-detects protocol) · `e` edit fields · `R` rename · `d` delete · `r` re-probe exit IP/region/ISP/type · `q` quit
+- `↑`/`↓` navigate · `Enter` enable & quit · `space` toggle on/off · `a` add wizard (prefills from `HTTPS_PROXY` when present and auto-detects protocol) · `e` edit fields · `R` rename · `d` delete · `r` re-probe exit IP/location/ISP/type · `q` quit
 
 Enabling a proxy installs an `agy` shim in `~/.local/bin` on Unix or `%LOCALAPPDATA%\agy-switch\bin` on Windows. Put that directory before the original agy directory on `PATH`. If an original executable occupies the shim path, it is moved to `agy.real` (or `agy.real.exe`). Disabling routing restores it, and subsequent `agy-switch` runs automatically repair the shim if `agy update` overwrites it. Pre-existing `HTTP_PROXY`/`HTTPS_PROXY` variables already exported in your shell still take precedence, and `agy-switch` itself routes quota, OAuth, and revoke requests through the active managed proxy.
 
@@ -84,29 +84,19 @@ SOCKS proxies use a separate local HTTP bridge so agy and its child tools can us
 
 ## Data and credentials
 
-Data is stored under `$XDG_DATA_HOME/agy-switch` (default `~/.local/share/agy-switch`) on Unix and `%LOCALAPPDATA%\agy-switch` on Windows. Profiles contain OAuth credentials and are written with private file permissions.
+Data is stored under `$XDG_DATA_HOME/agy-switch` (default `~/.local/share/agy-switch`) on Unix and `%LOCALAPPDATA%\agy-switch` on Windows (`profiles/<name>.json`, `current`, `meta.json`, `quota_cache.json`, `proxy.json`, `.netcheck`, and `bridge.log`). Profiles contain OAuth credentials and are written with private file permissions. Set `AGY_BIN` to override `agy` binary discovery on `PATH`.
 
 Live credentials use the macOS Keychain, Windows Credential Manager, or agy's token files in `~/.gemini`, according to the platform. Profile switching restores the selected credential to agy's live store.
 
 Account changes are serialized across agy-switch processes. Failed changes attempt to restore the previous credentials and profile files. An incomplete recovery returns an error and retains its recovery journal. If a command is interrupted, the next account operation attempts recovery before making another change.
 
-### OAuth client configuration
-
-Refreshing an expired quota access token requires the OAuth client associated with its refresh token. When neither environment variables nor `oauth_client.json` are configured, `agy-switch` automatically scans the local `agy` binary to discover the OAuth client credentials and caches the verified pair in `oauth_client.json` (with `0600` permissions on Unix).
-
-To override automatic discovery, configure `AGY_SWITCH_OAUTH_CLIENT_ID` and `AGY_SWITCH_OAUTH_CLIENT_SECRET`, or place an `oauth_client.json` file in the data directory:
-
-```json
-{"client_id":"your-client-id","client_secret":"your-client-secret"}
-```
-
-Set both environment variables together; they override the file and automatic discovery. On Unix, keep the file readable only by its owner (`chmod 600`). A different OAuth client's credentials cannot refresh an existing token. OAuth client credentials are not embedded in the source or distributed binaries. Account switching and cached quota display work without OAuth credentials; quota refresh reports an error if discovery fails or credentials are invalid.
-
 ## Build and test
 
-Use the Go version specified in `go.mod`:
+Use the Go version specified in `go.mod` (CI enforces `gofmt` formatting):
 
 ```sh
+test -z "$(gofmt -l pkg cmd)"
+go vet ./...
 go test -race ./...
 make build
 make build-all

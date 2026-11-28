@@ -134,7 +134,7 @@ func (m *managedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return tr.RoundTrip(req)
 }
 
-// ProbeProxy checks TCP reachability, tunneling to Google AI, and exit geo/IP classification.
+// ProbeProxy checks TCP reachability, tunneling to Google, and exit IP metadata.
 func ProbeProxy(ctx context.Context, cfg Config) *ProbeResult {
 	return ProbeProxyWithOptions(ctx, cfg, ProbeOptions{})
 }
@@ -199,7 +199,7 @@ func ProbeProxyWithOptions(ctx context.Context, cfg Config, opts ProbeOptions) *
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		res.Err = "cannot tunnel to googleapis — dead proxy, wrong protocol, or blocked by the local network"
+		res.Err = "cannot tunnel to Google — dead proxy, wrong protocol, or blocked by the local network"
 		return res
 	}
 	_ = resp.Body.Close()

@@ -2,15 +2,12 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ZhangNy301/agy-switch/pkg/config"
@@ -20,7 +17,6 @@ import (
 const (
 	NetStateOK      = "ok"
 	NetStateBlocked = "blocked"
-	NetStateRegion  = "region"
 
 	netOKTTL  = 6 * time.Hour
 	netBadTTL = 10 * time.Minute
@@ -28,7 +24,6 @@ const (
 
 type NetCheckOptions struct {
 	TargetURL  string
-	GeoURL     string
 	HTTPClient *http.Client
 	Now        time.Time
 }
@@ -53,7 +48,7 @@ func NetTag(store *Store, now time.Time) string {
 	return "D"
 }
 
-// CheckNetwork checks Google AI API reachability and exit country support, caching results in .netcheck.
+// CheckNetwork checks Google reachability, caching results in .netcheck.
 func CheckNetwork(ctx context.Context, paths *config.Paths, store *Store, opts NetCheckOptions) (string, string) {
 	now := opts.Now
 	if now.IsZero() {
@@ -71,18 +66,10 @@ func CheckNetwork(ctx context.Context, paths *config.Paths, store *Store, opts N
 						ttl = netOKTTL
 					}
 					if now.Sub(time.Unix(epoch, 0)) < ttl {
-						cc := fields[2]
-						if cc == "-" {
-							cc = ""
+						if fields[1] == "1" {
+							return NetStateOK, ""
 						}
-						switch fields[1] {
-						case "0":
-							return NetStateBlocked, cc
-						case "1":
-							return NetStateOK, cc
-						default:
-							return NetStateRegion, cc
-						}
+						return NetStateBlocked, ""
 					}
 				}
 			}
@@ -96,10 +83,6 @@ func CheckNetwork(ctx context.Context, paths *config.Paths, store *Store, opts N
 		} else {
 			targetURL = TargetEndpoint
 		}
-	}
-	geoURL := opts.GeoURL
-	if geoURL == "" {
-		geoURL = DefaultGeoURL
 	}
 
 	client := opts.HTTPClient
@@ -125,69 +108,24 @@ func CheckNetwork(ctx context.Context, paths *config.Paths, store *Store, opts N
 	}
 
 	reachable := false
-	cc := ""
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
-		if err != nil {
-			return
-		}
+	if req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil); err == nil {
 		if resp, err := client.Do(req); err == nil {
 			_ = resp.Body.Close()
 			reachable = true
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		gReq, err := http.NewRequestWithContext(ctx, http.MethodGet, geoURL, nil)
-		if err != nil {
-			return
-		}
-		gResp, err := client.Do(gReq)
-		if err != nil {
-			return
-		}
-		defer gResp.Body.Close()
-		if body, rErr := io.ReadAll(io.LimitReader(gResp.Body, 64*1024)); rErr == nil {
-			var res struct {
-				Country     string `json:"country"`
-				CountryCode string `json:"country_code"`
-			}
-			if json.Unmarshal(body, &res) == nil {
-				cc = strings.ToUpper(res.Country)
-				if cc == "" {
-					cc = strings.ToUpper(res.CountryCode)
-				}
-			}
-		}
-	}()
-	wg.Wait()
+	}
 
 	stateCode := 1
+	state := NetStateOK
 	if !reachable {
 		stateCode = 0
-	} else if IsBlockedCountry(cc) {
-		stateCode = 2
+		state = NetStateBlocked
 	}
 
 	if cacheFile != "" {
-		ccToken := cc
-		if ccToken == "" {
-			ccToken = "-"
-		}
-		content := fmt.Sprintf("%d %d %s %s", now.Unix(), stateCode, ccToken, tag)
+		content := fmt.Sprintf("%d %d - %s", now.Unix(), stateCode, tag)
 		_ = util.WriteFileAtomic(cacheFile, []byte(content), 0600)
 	}
 
-	switch stateCode {
-	case 0:
-		return NetStateBlocked, cc
-	case 1:
-		return NetStateOK, cc
-	default:
-		return NetStateRegion, cc
-	}
+	return state, ""
 }

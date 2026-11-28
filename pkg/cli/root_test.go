@@ -325,7 +325,7 @@ func TestNetCheckWarningAndLoginPrecheck(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd := NewCommand(paths, Dependencies{
 		TokenStore: keyring.NewFileStore(paths),
-		NetCheck:   func(context.Context) (string, string) { return proxy.NetStateRegion, "CN" },
+		NetCheck:   func(context.Context) (string, string) { return proxy.NetStateBlocked, "" },
 		IsTTY:      func() bool { return false },
 	})
 	cmd.SetOut(io.Discard)
@@ -334,15 +334,15 @@ func TestNetCheckWarningAndLoginPrecheck(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr.String(), "IP region (CN) is not supported") {
-		t.Fatalf("expected region warning, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "cannot reach Google from this network") {
+		t.Fatalf("expected unreachable warning, got: %s", stderr.String())
 	}
 
-	// Non-TTY login should abort on unsupported region
+	// Non-TTY login should abort when Google is unreachable
 	stderr.Reset()
 	cmdLogin := NewCommand(paths, Dependencies{
 		TokenStore: keyring.NewFileStore(paths),
-		NetCheck:   func(context.Context) (string, string) { return proxy.NetStateRegion, "CN" },
+		NetCheck:   func(context.Context) (string, string) { return proxy.NetStateBlocked, "" },
 		IsTTY:      func() bool { return false },
 		FindAgy:    func(*config.Paths) (string, error) { return "agy", nil },
 	})
@@ -350,7 +350,7 @@ func TestNetCheckWarningAndLoginPrecheck(t *testing.T) {
 	cmdLogin.SetErr(&stderr)
 	cmdLogin.SetArgs([]string{"login"})
 	if err := cmdLogin.Execute(); err == nil {
-		t.Fatal("expected non-TTY login to fail in unsupported region")
+		t.Fatal("expected non-TTY login to fail when network is unreachable")
 	}
 
 	// Interactive TTY login prompts for profile name when no arg given

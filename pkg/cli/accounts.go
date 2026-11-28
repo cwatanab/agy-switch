@@ -33,15 +33,6 @@ func (a *app) adoptLiveIfOrphan(ctx context.Context, cmd *cobra.Command) (string
 	if tok.AccessToken == "" && tok.RefreshToken == "" {
 		return "", nil
 	}
-	refreshed := false
-	if tok.RefreshToken != "" {
-		if err := a.quota.ForceRefreshToken(ctx, tok); err == nil {
-			refreshed = true
-			if updated, uErr := profile.UpdateRawToken(tok); uErr == nil {
-				data = updated
-			}
-		}
-	}
 	name, err := a.profiles.Save("", data)
 	if err != nil {
 		return "", err
@@ -50,13 +41,16 @@ func (a *app) adoptLiveIfOrphan(ctx context.Context, cmd *cobra.Command) (string
 		return "", err
 	}
 	_ = a.profiles.RecordActivated(name, time.Now())
-	_, _ = a.quota.FetchContext(ctx, tok, false)
-
-	note := ""
-	if !refreshed && tok.RefreshToken != "" {
-		note = " (offline — identity from cached token)"
+	if info, qErr := a.quota.FetchContext(ctx, tok, false); qErr == nil && info != nil && info.RefreshedToken != nil {
+		if updated, uErr := profile.UpdateRawToken(info.RefreshedToken); uErr == nil {
+			_ = a.profiles.UpdateToken(name, updated)
+		}
+		if info.Email != "" {
+			tok.Email = info.Email
+		}
 	}
-	cmd.Printf("Adopted existing login as profile: %s (%s)%s\n", name, tok.Email, note)
+
+	cmd.Printf("Adopted existing login as profile: %s (%s)\n", name, tok.Email)
 	return name, nil
 }
 
@@ -92,8 +86,7 @@ func (a *app) pickAndLaunch(cmd *cobra.Command, args []string) error {
 		}
 		cmd.Printf("Switched to profile: %s\n", selected)
 		a.warnRunningAgy(cmd)
-		code, execErr := a.deps.LaunchAgy(paths, nil)
-		return launchResult(code, execErr)
+		return a.deps.StartAgy(paths, nil)
 	}
 	return nil
 }

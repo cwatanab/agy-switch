@@ -218,13 +218,18 @@ type AccountBlockWidths struct {
 
 // ComputeAccountBlockWidths calculates aligned column widths across profiles.
 func ComputeAccountBlockWidths(profiles []profile.Profile) AccountBlockWidths {
-	w := AccountBlockWidths{NameWidth: 14, TierWidth: len("[?]")}
+	w := AccountBlockWidths{NameWidth: 14, TierWidth: 0}
 	for _, p := range profiles {
 		if n := utf8.RuneCountInString(p.Name); n > w.NameWidth {
 			w.NameWidth = n
 		}
-		if tLen := tierBadgeLen(p.Tier); tLen > w.TierWidth {
-			w.TierWidth = tLen
+		if p.Tier != "" && p.Tier != "?" {
+			if tLen := tierBadgeLen(p.Tier); tLen > w.TierWidth {
+				w.TierWidth = tLen
+			}
+			if w.TierWidth < len("[?]") {
+				w.TierWidth = len("[?]")
+			}
 		}
 		if e := utf8.RuneCountInString(p.Email); e > w.EmailWidth {
 			w.EmailWidth = e
@@ -267,9 +272,13 @@ func WriteAccountBlock(sb *strings.Builder, p profile.Profile, q *quota.QuotaInf
 	}
 	hb.WriteString(spaces(widths.NameWidth - utf8.RuneCountInString(p.Name)))
 	hb.WriteByte(' ')
-	hb.WriteString(tierBadge)
-	hb.WriteString(spaces(widths.TierWidth - tierLen))
-	hb.WriteString("  ")
+	if widths.TierWidth > 0 {
+		hb.WriteString(tierBadge)
+		hb.WriteString(spaces(widths.TierWidth - tierLen))
+		hb.WriteString("  ")
+	} else {
+		hb.WriteByte(' ')
+	}
 	hb.WriteString(DimStyle.Render(p.Email))
 	hb.WriteString(spaces(widths.EmailWidth - utf8.RuneCountInString(p.Email)))
 	hb.WriteString("  ")

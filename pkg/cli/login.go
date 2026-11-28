@@ -27,16 +27,10 @@ func sanitizeProfileBase(s string) string {
 
 func (a *app) login(cmd *cobra.Command, args []string) error {
 	if !a.deps.DisableNetCheck {
-		state, cc := a.checkNetwork(cmd.Context())
+		state, _ := a.checkNetwork(cmd.Context())
 		if state != proxy.NetStateOK {
-			why := "Google's API is unreachable from this network"
-			if state == proxy.NetStateRegion {
-				if cc == "" {
-					cc = "?"
-				}
-				why = fmt.Sprintf("your IP region (%s) is not supported by Google AI", cc)
-			}
-			cmd.PrintErrf("warning: %s — the login callback will likely hang.\n  fix: agy-switch proxy (add a proxy through a supported region first)\n", why)
+			why := "Google is unreachable from this network"
+			cmd.PrintErrf("warning: %s — login may fail.\n  fix: agy-switch proxy (configure a proxy if required by your network)\n", why)
 			if !a.deps.IsTTY() {
 				return fmt.Errorf("%s", why)
 			}

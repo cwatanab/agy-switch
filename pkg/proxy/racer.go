@@ -12,7 +12,7 @@ import (
 	xproxy "golang.org/x/net/proxy"
 )
 
-const TargetEndpoint = "https://daily-cloudcode-pa.googleapis.com"
+const TargetEndpoint = "https://accounts.google.com"
 
 func testProxy(parent context.Context, proto, server string, port int, user, pass string, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(parent, timeout)
@@ -135,5 +135,5 @@ func RaceProtocol(server string, port int, user, pass string) (string, error) {
 		return bestResult.proto, nil
 	}
 
-	return "", fmt.Errorf("all protocols failed to tunnel to Google AI")
+	return "", fmt.Errorf("all protocols failed to tunnel to Google")
 }

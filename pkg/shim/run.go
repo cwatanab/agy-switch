@@ -72,31 +72,49 @@ func BuildProxyEnv(paths *config.Paths, store *proxy.Store) ([]string, error) {
 	return env, nil
 }
 
-func ExecuteRealAgy(paths *config.Paths, args []string) (int, error) {
+func prepareRealAgy(paths *config.Paths) (string, []string, error) {
 	if os.Getenv("AGY_SWITCH_NO_REASSERT") == "" {
 		store := keyring.DefaultStore(paths)
 		pm := profile.NewManager(paths, store)
 		if err := pm.ReassertCurrent(); err != nil {
-			return 1, fmt.Errorf("restore selected account: %w", err)
+			return "", nil, fmt.Errorf("restore selected account: %w", err)
 		}
 	}
 
 	realAgy, err := FindRealAgy(paths)
 	if err != nil {
-		return 1, err
+		return "", nil, err
 	}
 
 	store := proxy.NewStore(paths)
 	proxyEnv, err := BuildProxyEnv(paths, store)
 	if err != nil {
-		return 1, fmt.Errorf("build proxy env: %w", err)
+		return "", nil, fmt.Errorf("build proxy env: %w", err)
+	}
+
+	return realAgy, append(os.Environ(), proxyEnv...), nil
+}
+
+// StartRealAgy launches the real agy binary and exits agy-switch without waiting.
+func StartRealAgy(paths *config.Paths, args []string) error {
+	realAgy, env, err := prepareRealAgy(paths)
+	if err != nil {
+		return err
+	}
+	return startRealAgyProcess(realAgy, args, env)
+}
+
+func ExecuteRealAgy(paths *config.Paths, args []string) (int, error) {
+	realAgy, env, err := prepareRealAgy(paths)
+	if err != nil {
+		return 1, err
 	}
 
 	cmd := exec.Command(realAgy, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), proxyEnv...)
+	cmd.Env = env
 
 	// Signal handling
 	sigChan := make(chan os.Signal, 1)
